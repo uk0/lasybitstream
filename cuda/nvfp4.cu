@@ -70,10 +70,61 @@ __global__ void gemm_nvfp4_kernel(const float* __restrict__ x, const uint8_t* __
   y[(int64_t)m * OUT + o] = acc;
 }
 
+__device__ __forceinline__ uint8_t get_byte(uint4 p, int b) {
+  uint32_t w = (b < 8) ? ((b < 4) ? p.x : p.y) : ((b < 12) ? p.z : p.w);
+  return (uint8_t)(w >> (8 * (b & 3)));
+}
+
+// Bandwidth-optimal M=1 (decode) GEMV: one warp per output row, K tiles of 1024.
+// Each lane streams a contiguous 32-column chunk as one 128-bit weight load
+// (32 fp4 = 16 bytes), applies the two group-16 fp8 scales, and fmaf-accumulates
+// against the shared activation tile; a warp shuffle reduces the row. (researcher plan)
+template <int WARPS>
+__global__ void gemv_nvfp4_m1_kernel(const float* __restrict__ x, const uint8_t* __restrict__ packed,
+                                     const uint8_t* __restrict__ scale, float gscale,
+                                     float* __restrict__ y, int OUT, int IN, int in2, int gg) {
+  __shared__ float xs[32][33];                 // 1024 activations; pad avoids bank conflicts
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int o = blockIdx.x * WARPS + warp;
+  const uint8_t* wr = (o < OUT) ? packed + (int64_t)o * in2 : nullptr;
+  const uint8_t* sr = (o < OUT) ? scale + (int64_t)o * gg : nullptr;
+  float acc = 0.f;
+  for (int k0 = 0; k0 < IN; k0 += 1024) {
+    int q = threadIdx.x * 4;                    // 256 threads * 4 = 1024 activations
+    float4 a = *reinterpret_cast<const float4*>(x + k0 + q);
+    int owner = q >> 5, j = q & 31;
+    xs[owner][j] = a.x; xs[owner][j + 1] = a.y; xs[owner][j + 2] = a.z; xs[owner][j + 3] = a.w;
+    __syncthreads();
+    if (o < OUT) {
+      int col = k0 + lane * 32;
+      uint4 p = *reinterpret_cast<const uint4*>(wr + (col >> 1));
+      uint16_t raw2 = *reinterpret_cast<const uint16_t*>(sr + (col >> 4));
+      float s0 = fp8e4m3_to_float((uint8_t)(raw2 & 0xff)) / gscale;
+      float s1 = fp8e4m3_to_float((uint8_t)(raw2 >> 8)) / gscale;
+      #pragma unroll
+      for (int b = 0; b < 16; ++b) {
+        uint8_t byte = get_byte(p, b);
+        float s = (b < 8) ? s0 : s1;
+        acc = fmaf(xs[lane][2 * b], fp4_to_float(byte & 0xF) * s, acc);
+        acc = fmaf(xs[lane][2 * b + 1], fp4_to_float(byte >> 4) * s, acc);
+      }
+    }
+    __syncthreads();
+  }
+  for (int d = 16; d; d >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, d);
+  if (lane == 0 && o < OUT) y[o] = acc;
+}
+
 void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, float gscale,
                 float* y, int M, int64_t out, int64_t in, int group) {
   int in2 = (int)(in / 2);
   int gg = (int)(in / group);
+  if (M == 1 && group == 16 && (in % 1024) == 0) {   // fast decode GEMV path
+    const int W = 8;
+    int grid = (int)((out + W - 1) / W);
+    gemv_nvfp4_m1_kernel<W><<<grid, W * 32>>>(x, packed, scale, gscale, y, (int)out, (int)in, in2, gg);
+    return;
+  }
   dim3 block(64, 4);
   dim3 grid((unsigned)((out + block.x - 1) / block.x), (unsigned)((M + block.y - 1) / block.y));
   gemm_nvfp4_kernel<<<grid, block>>>(x, packed, scale, gscale, y, M, (int)out, (int)in,

@@ -22,7 +22,45 @@ __global__ void gemm_bf16_kernel(const float* __restrict__ x, const uint16_t* __
   for (int i = 0; i < IN; ++i) acc += xr[i] * bf16f(wr[i]);
   y[(int64_t)m * OUT + o] = acc;
 }
+// Bandwidth-optimal M=1 (decode) BF16 GEMV: one warp per output row, K tiles of
+// 1024, each lane streaming a contiguous 32-column chunk (four 128-bit loads).
+template <int WARPS>
+__global__ void gemv_bf16_m1_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                    float* __restrict__ y, int OUT, int IN) {
+  __shared__ float xs[32][33];
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int o = blockIdx.x * WARPS + warp;
+  const uint16_t* wr = (o < OUT) ? w + (int64_t)o * IN : nullptr;
+  float acc = 0.f;
+  for (int k0 = 0; k0 < IN; k0 += 1024) {
+    int q = threadIdx.x * 4;
+    float4 a = *reinterpret_cast<const float4*>(x + k0 + q);
+    int owner = q >> 5, j = q & 31;
+    xs[owner][j] = a.x; xs[owner][j + 1] = a.y; xs[owner][j + 2] = a.z; xs[owner][j + 3] = a.w;
+    __syncthreads();
+    if (o < OUT) {
+      const uint4* wp = reinterpret_cast<const uint4*>(wr + k0 + lane * 32);
+      #pragma unroll
+      for (int u = 0; u < 4; ++u) {              // 4 * 8 bf16 = 32 columns
+        uint4 pk = wp[u];
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(&pk);
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) acc = fmaf(xs[lane][u * 8 + t], bf16f(h[t]), acc);
+      }
+    }
+    __syncthreads();
+  }
+  for (int d = 16; d; d >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, d);
+  if (lane == 0 && o < OUT) y[o] = acc;
+}
+
 void gemm_bf16(const float* x, const uint16_t* w, float* y, int M, int OUT, int IN) {
+  if (M == 1 && (IN % 1024) == 0) {              // fast decode GEMV path
+    const int W = 8;
+    int grid = (OUT + W - 1) / W;
+    gemv_bf16_m1_kernel<W><<<grid, W * 32>>>(x, w, y, OUT, IN);
+    return;
+  }
   dim3 block(256), grid((OUT + 255) / 256, M);
   gemm_bf16_kernel<<<grid, block>>>(x, w, y, M, OUT, IN);
 }
