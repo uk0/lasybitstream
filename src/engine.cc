@@ -442,6 +442,34 @@ int Engine::validate(const std::vector<int>& ids, const std::string& test_dir) {
   return r;
 }
 
+// Isolates the batched-GEMM amortization (the real question for aggregate batching):
+// time the whole NVFP4+BF16 weight set for M rows. A batched decode step touches
+// every weight once regardless of M, so if the GEMMs amortize, tok/s = M/time scales.
+double Engine::bench(int M, int iters) {
+  float* x = dalloc((int64_t)M * INTER);
+  float* y = dalloc((int64_t)M * INTER);
+  auto run = [&]() {
+    for (int L = 0; L < NL; ++L) {
+      std::string lp = p_->w.LP + "layers." + std::to_string(L) + ".";
+      bool attn = (L % FA_INT) == (FA_INT - 1);
+      if (attn) { p_->w.nvfp4(x, lp + "self_attn.q_proj", y, M, NH * 2 * HD, H);
+                  p_->w.nvfp4(x, lp + "self_attn.o_proj", y, M, H, Q_SIZE); }
+      else { p_->w.bf16(x, lp + "linear_attn.in_proj_qkv", y, M, L_Q * 2 + L_V, H);
+             p_->w.nvfp4(x, lp + "linear_attn.out_proj", y, M, H, L_V); }
+      p_->w.nvfp4(x, lp + "mlp.gate_proj", y, M, INTER, H);
+      p_->w.nvfp4(x, lp + "mlp.up_proj", y, M, INTER, H);
+      p_->w.nvfp4(x, lp + "mlp.down_proj", y, M, H, INTER);
+    }
+  };
+  run(); cudaDeviceSynchronize();                      // warmup
+  auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < iters; ++i) run();
+  cudaDeviceSynchronize();
+  double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  cudaFree(x); cudaFree(y);
+  return 1000.0 * M * iters / ms;                      // aggregate tok/s (GEMM-bound)
+}
+
 int Engine::max_ctx() const { return p_->max_ctx; }
 
 }  // namespace lb

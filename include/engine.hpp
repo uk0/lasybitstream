@@ -35,6 +35,10 @@ class Engine {
   // scripts/ref_forward.py's golden files in `test_dir`. Returns argmax.
   int validate(const std::vector<int>& ids, const std::string& test_dir);
 
+  // Aggregate-batching throughput probe: effective tok/s for a forward over M rows
+  // (weights read once), i.e. the per-step throughput of a batch of M concurrent decodes.
+  double bench(int M, int iters = 3);
+
   // --- vision / multimodal ---
   // Encode one image's preprocessed patches `pixels` [t*h*w, 1536] into image
   // embeddings held by the engine. Returns the merged image-token count.

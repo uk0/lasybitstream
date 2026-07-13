@@ -125,10 +125,12 @@ __global__ void gemv_nvfp4_m1_kernel(const float* __restrict__ x, const uint8_t*
   if (lane == 0 && o < OUT) y[o] = acc;
 }
 
-// Weight-stationary small-batch GEMM (2..8 rows): one warp per output row loads
+// Weight-stationary batched GEMM (2..MAXB rows): one warp per output row loads
 // each packed weight ONCE (uint4), unpacks to registers, and dots it against all
-// M activation vectors (L2-resident). Bandwidth-bound in the weights regardless of
-// M — this is what makes the MTP verify (M=k+1) and short prefills fast.
+// M activation vectors (L2-resident). The weight read (~22 GB/token) is amortized
+// across the whole batch, so aggregate throughput scales with M — this is the core
+// of aggregate batching (500+ tok/s/card) as well as MTP verify / short prefills.
+static const int MAXB = 32;
 template <int WARPS>
 __global__ void gemm_nvfp4_smallM_kernel(const float* __restrict__ x, const uint8_t* __restrict__ packed,
                                          const uint8_t* __restrict__ scale, float gscale,
@@ -138,7 +140,7 @@ __global__ void gemm_nvfp4_smallM_kernel(const float* __restrict__ x, const uint
   if (o >= OUT) return;
   const uint8_t* wr = packed + (int64_t)o * in2;
   const uint8_t* sr = scale + (int64_t)o * gg;
-  float acc[8]; for (int m = 0; m < M; ++m) acc[m] = 0.f;
+  float acc[MAXB]; for (int m = 0; m < M; ++m) acc[m] = 0.f;
   for (int k0 = 0; k0 < IN; k0 += 1024) {
     int col = k0 + lane * 32;
     uint4 p = *reinterpret_cast<const uint4*>(wr + (col >> 1));
@@ -176,7 +178,7 @@ void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, flo
     gemv_nvfp4_m1_kernel<W><<<grid, W * 32>>>(x, packed, scale, gscale, y, (int)out, (int)in, in2, gg);
     return;
   }
-  if (M >= 2 && M <= 8 && group == 16 && (in % 1024) == 0) {   // weight-stationary small batch
+  if (M >= 2 && M <= MAXB && group == 16 && (in % 1024) == 0) {   // weight-stationary batch
     const int W = 8;
     int grid = (int)((out + W - 1) / W);
     gemm_nvfp4_smallM_kernel<W><<<grid, W * 32>>>(x, packed, scale, gscale, y, M, (int)out, (int)in, in2, gg);

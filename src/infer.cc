@@ -13,11 +13,19 @@ using namespace lb;
 int main(int argc, char** argv) {
   std::string mdir = argc > 1 ? argv[1] : "/model";
   std::string tdir = argc > 2 ? argv[2] : "test";
-  int gen = 0, spec = 0; bool mm = false;
+  int gen = 0, spec = 0; bool mm = false, bench = false;
   for (int i = 3; i < argc; ++i) {
     if (std::string(argv[i]) == "gen" && i + 1 < argc) gen = atoi(argv[i + 1]);
     if (std::string(argv[i]) == "spec" && i + 1 < argc) spec = atoi(argv[i + 1]);  // k drafts
     if (std::string(argv[i]) == "mm") mm = true;
+    if (std::string(argv[i]) == "bench") bench = true;
+  }
+
+  if (bench) {                                          // aggregate-batching throughput curve
+    Engine eng; eng.load(mdir, 64);
+    printf("=== aggregate throughput (weights read once per forward) ===\n");
+    for (int M : {1, 2, 4, 8, 16, 32}) printf("  batch M=%2d : %.1f tok/s\n", M, eng.bench(M, 3));
+    return 0;
   }
 
   if (mm) {  // multimodal: reference image (vis_pixels/grid) + prompt (vis_input_ids)
