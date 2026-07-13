@@ -66,4 +66,54 @@ void gdn_recurrence(const float* q, const float* k, const float* v, const float*
                                               T, HK, HV, DK, DV);
 }
 
+__global__ void gdn_gating_kernel(const float* __restrict__ A_log, const float* __restrict__ a,
+                                  const float* __restrict__ b, const float* __restrict__ dt_bias,
+                                  float* __restrict__ g_out, float* __restrict__ beta_out,
+                                  int T, int HV) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (int64_t)T * HV) return;
+  int hv = (int)(idx % HV);
+  float x = a[idx] + dt_bias[hv];
+  float sp = (x > 20.f) ? x : log1pf(expf(x));       // softplus, stable
+  g_out[idx] = -expf(A_log[hv]) * sp;
+  beta_out[idx] = 1.f / (1.f + expf(-b[idx]));        // sigmoid
+}
+
+void gdn_gating(const float* A_log, const float* a, const float* b, const float* dt_bias,
+                float* g_out, float* beta_out, int T, int HV) {
+  int block = 256;
+  int grid = (int)(((int64_t)T * HV + block - 1) / block);
+  gdn_gating_kernel<<<grid, block>>>(A_log, a, b, dt_bias, g_out, beta_out, T, HV);
+}
+
+// out = rmsnorm(x)*weight * silu(z), one block per row.
+__global__ void rmsnorm_gated_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                     const float* __restrict__ z, float eps,
+                                     float* __restrict__ out, int H) {
+  extern __shared__ float red[];
+  const float* xr = x + (int64_t)blockIdx.x * H;
+  const float* zr = z + (int64_t)blockIdx.x * H;
+  float* outr = out + (int64_t)blockIdx.x * H;
+  float local = 0.f;
+  for (int i = threadIdx.x; i < H; i += blockDim.x) local += xr[i] * xr[i];
+  red[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv = rsqrtf(red[0] / H + eps);
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    float zi = zr[i];
+    float silu = zi / (1.f + expf(-zi));
+    outr[i] = xr[i] * inv * w[i] * silu;
+  }
+}
+
+void rmsnorm_gated(const float* x, const float* w, const float* z, float eps,
+                   float* out, int M, int H) {
+  int block = 128;
+  rmsnorm_gated_kernel<<<M, block, block * sizeof(float)>>>(x, w, z, eps, out, H);
+}
+
 }  // namespace lb
