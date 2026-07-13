@@ -4,7 +4,7 @@
 
 namespace lb {
 
-// Per-row RMSNorm: y[m,i] = x[m,i] * rsqrt(mean_i(x[m,i]^2) + eps) * weight[i].
+// Per-row Gemma-style RMSNorm (Qwen3.5): y = x * rsqrt(mean(x^2)+eps) * (1+weight).
 void rmsnorm(const float* x, const float* weight, float eps, float* y, int M, int hidden);
 
 // SwiGLU gate: out = silu(gate) * up, silu(x) = x * sigmoid(x).

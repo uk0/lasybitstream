@@ -22,7 +22,8 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restr
     __syncthreads();
   }
   float inv = rsqrtf(sh[0] / H + eps);
-  for (int i = threadIdx.x; i < H; i += blockDim.x) yr[i] = xr[i] * inv * w[i];
+  // Gemma-style RMSNorm: scale by (1 + weight), matching vLLM's Qwen3_5RMSNorm.
+  for (int i = threadIdx.x; i < H; i += blockDim.x) yr[i] = xr[i] * inv * (1.f + w[i]);
 }
 
 void rmsnorm(const float* x, const float* w, float eps, float* y, int M, int H) {

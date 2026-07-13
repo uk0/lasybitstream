@@ -31,7 +31,7 @@ int main() {
       double ss = 0;
       for (int i = 0; i < H; ++i) { float v = x[m * H + i]; ss += (double)v * v; }
       float inv = (float)(1.0 / std::sqrt(ss / H + eps));
-      for (int i = 0; i < H; ++i) yref[m * H + i] = x[m * H + i] * inv * w[i];
+      for (int i = 0; i < H; ++i) yref[m * H + i] = x[m * H + i] * inv * (1.f + w[i]);
     }
     float *dx, *dw, *dy;
     cudaMalloc(&dx, x.size() * 4); cudaMalloc(&dw, w.size() * 4); cudaMalloc(&dy, x.size() * 4);
