@@ -25,35 +25,41 @@ __global__ void gemm_bf16_kernel(const float* __restrict__ x, const uint16_t* __
   y[(int64_t)m * OUT + o] = acc;
 }
 // Bandwidth-optimal M=1 (decode) BF16 GEMV: one warp per output row, K tiles of
-// 1024, each lane streaming a contiguous 32-column chunk (four 128-bit loads).
+// 1024. No shared staging / no barriers — activations (tiny, L2-resident) are read
+// straight from global, and each K-tile issues all four 128-bit weight loads before
+// the FMAs so the load latency is hidden (bf16 has little ALU to hide it otherwise).
 template <int WARPS>
 __global__ void gemv_bf16_m1_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                                     float* __restrict__ y, int OUT, int IN) {
-  __shared__ float xs[32][33];
-  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  int o = blockIdx.x * WARPS + warp;
-  const uint16_t* wr = (o < OUT) ? w + (int64_t)o * IN : nullptr;
+  int lane = threadIdx.x & 31;
+  int o = blockIdx.x * WARPS + (threadIdx.x >> 5);
+  if (o >= OUT) return;
+  const uint16_t* wr = w + (int64_t)o * IN;
+  int ntiles = IN / 1024;
   float acc = 0.f;
-  for (int k0 = 0; k0 < IN; k0 += 1024) {
-    int q = threadIdx.x * 4;
-    float4 a = *reinterpret_cast<const float4*>(x + k0 + q);
-    int owner = q >> 5, j = q & 31;
-    xs[owner][j] = a.x; xs[owner][j + 1] = a.y; xs[owner][j + 2] = a.z; xs[owner][j + 3] = a.w;
-    __syncthreads();
-    if (o < OUT) {
-      const uint4* wp = reinterpret_cast<const uint4*>(wr + k0 + lane * 32);
+  uint4 wk[4];                                                  // current tile's 32 weights
+  { const uint4* wp = reinterpret_cast<const uint4*>(wr + lane * 32);
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) wk[u] = wp[u]; }                // prefetch tile 0
+  for (int k = 0; k < ntiles; ++k) {
+    uint4 nx[4];                                                // prefetch tile k+1 while computing tile k
+    if (k + 1 < ntiles) { const uint4* np = reinterpret_cast<const uint4*>(wr + (k + 1) * 1024 + lane * 32);
       #pragma unroll
-      for (int u = 0; u < 4; ++u) {              // 4 * 8 bf16 = 32 columns
-        uint4 pk = wp[u];
-        const uint16_t* h = reinterpret_cast<const uint16_t*>(&pk);
-        #pragma unroll
-        for (int t = 0; t < 8; ++t) acc = fmaf(xs[lane][u * 8 + t], bf16f(h[t]), acc);
-      }
-    }
-    __syncthreads();
+      for (int u = 0; u < 4; ++u) nx[u] = np[u]; }
+    const float4* xp = reinterpret_cast<const float4*>(x + k * 1024 + lane * 32);
+    float4 a[8];
+    #pragma unroll
+    for (int u = 0; u < 8; ++u) a[u] = xp[u];
+    const float* av = &a[0].x;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) { const uint16_t* hh = (const uint16_t*)&wk[u];
+      #pragma unroll
+      for (int t = 0; t < 8; ++t) acc = fmaf(av[u * 8 + t], bf16f(hh[t]), acc); }
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) wk[u] = nx[u];
   }
   for (int d = 16; d; d >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, d);
-  if (lane == 0 && o < OUT) y[o] = acc;
+  if (lane == 0) y[o] = acc;
 }
 
 // Weight-stationary batched BF16 GEMM (2..MAXB rows): weight row loaded once,
