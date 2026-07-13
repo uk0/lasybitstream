@@ -33,6 +33,7 @@ struct Weights {
   SafeTensors st;
   std::map<std::string, void*> cache;
   std::string LP = "model.language_model.";
+  ~Weights() { for (auto& kv : cache) cudaFree(kv.second); }   // free uploaded device weights
 
   void* up_raw(const std::string& n) {
     auto it = cache.find(n);
@@ -85,6 +86,11 @@ struct Buf {
     mg = dalloc((int64_t)T * INTER); mu = dalloc((int64_t)T * INTER); msw = dalloc((int64_t)T * INTER);
     cudaMalloc(&ids_d, T * sizeof(int)); cudaMalloc(&pos3d_d, 3 * T * sizeof(int));
   }
+  void free() {
+    for (float* p : {h, xn, xn2, mix, state, logits, qkv, z, ga, gb, conv, q, k, v, g, beta, recur,
+                     gated, qg, aq, agate, ak, av, aout, agated, mg, mu, msw}) cudaFree(p);
+    cudaFree(ids_d); cudaFree(pos3d_d);
+  }
 };
 
 static double compare(const std::string& ref, const float* dev, int64_t n) {
@@ -108,6 +114,16 @@ struct Engine::Impl {
   float* img_embeds = nullptr;                         // [merged, H] for the current image
   int img_merged = 0;
   std::string mdir;
+
+  ~Impl() {
+    if (kc.empty()) return;                            // never loaded
+    b.free();
+    for (int L = 0; L < NL; ++L) { cudaFree(kc[L]); cudaFree(vc[L]); cudaFree(gst[L]); cudaFree(cst[L]);
+      if (L < (int)gst_bak.size()) { cudaFree(gst_bak[L]); cudaFree(cst_bak[L]); } }
+    for (float* p : {m_emb, m_hn, m_en, m_cat, m_x, m_xn, m_tmp, m_qg, m_q, m_gate, m_k, m_v, m_ao,
+                     m_ag, m_mg, m_mu, m_msw, m_kc, m_vc, m_logits_all, m_hlast, m_dh, img_embeds}) cudaFree(p);
+    cudaFree(m_id); cudaFree(m_pos);
+  }
 
   void alloc_caches() {
     kc.assign(NL, nullptr); vc.assign(NL, nullptr); gst.assign(NL, nullptr); cst.assign(NL, nullptr);

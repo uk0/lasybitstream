@@ -10,6 +10,7 @@ namespace lb {
 
 class VisionTower {
  public:
+  ~VisionTower();                                     // frees uploaded device weights
   void load(const std::string& model_dir);           // opens model.safetensors, mmap
   // Encode one image: `pixels_dev` [S,1536] (S = t*h*w patches, device f32),
   // grid (t,h,w). Writes merged embeddings [merged, 5120] to out_dev (device,

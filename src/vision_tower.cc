@@ -28,6 +28,7 @@ float* VisionTower::f32(const std::string& n) {
   float* d = dalloc(ne); cudaMemcpy(d, h.data(), ne * 4, cudaMemcpyHostToDevice); cache_[k] = d; return d;
 }
 
+VisionTower::~VisionTower() { for (auto& kv : cache_) cudaFree(kv.second); }
 void VisionTower::load(const std::string& model_dir) { st_.open(model_dir + "/model.safetensors"); }
 
 int VisionTower::encode(const float* d_pix, int gt, int gh, int gw, float* out) {
