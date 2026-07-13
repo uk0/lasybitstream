@@ -6,15 +6,17 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 using namespace lb;
 
 int main(int argc, char** argv) {
   std::string mdir = argc > 1 ? argv[1] : "/model";
   std::string tdir = argc > 2 ? argv[2] : "test";
-  int gen = 0; bool mm = false;
+  int gen = 0, spec = 0; bool mm = false;
   for (int i = 3; i < argc; ++i) {
     if (std::string(argv[i]) == "gen" && i + 1 < argc) gen = atoi(argv[i + 1]);
+    if (std::string(argv[i]) == "spec" && i + 1 < argc) spec = atoi(argv[i + 1]);  // k drafts
     if (std::string(argv[i]) == "mm") mm = true;
   }
 
@@ -44,9 +46,18 @@ int main(int argc, char** argv) {
     int x; while (fread(&x, 4, 1, f) == 1) ids.push_back(x); fclose(f); }
   printf("prompt T=%zu:", ids.size()); for (int i : ids) printf(" %d", i); printf("\n");
 
-  Engine eng; eng.load(mdir, ids.size() + (gen > 0 ? gen : 1) + 2);
+  int want = gen > 0 ? gen : 24;
+  Engine eng; eng.load(mdir, ids.size() + want + 12);
 
-  if (gen > 0) {
+  if (spec > 0) {                                        // MTP speculative decode vs greedy
+    std::vector<int> g = eng.generate(ids, want, 248046);
+    std::vector<int> s = eng.generate_spec(ids, want, 248046, spec);
+    size_t common = std::min(g.size(), s.size()); bool match = true;
+    for (size_t i = 0; i < common; ++i) if (g[i] != s[i]) { match = false; break; }
+    printf("spec k=%d: greedy %zu tok, spec %zu tok, prefix-match=%s\n",
+           spec, g.size(), s.size(), match ? "YES (identical output)" : "NO — BUG");
+    printf("spec ids:"); for (int t : s) printf(" %d", t); printf("\n");
+  } else if (gen > 0) {
     std::vector<int> outs = eng.generate(ids, gen, -1);   // no eos stop; fixed count
     std::vector<int> all = ids; for (int t : outs) all.push_back(t);
     FILE* f = fopen((tdir + "/gen_ids.i32").c_str(), "wb");

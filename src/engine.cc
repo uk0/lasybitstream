@@ -125,7 +125,7 @@ struct Engine::Impl {
   // means a fresh sequence (prefill). Returns the greedy next token.
   int forward_tokens(const std::vector<int>& ids, int T, int start_pos, const std::string* tdir,
                      const int* pos3d_host = nullptr, const float* img_embeds = nullptr,
-                     int img_pos = -1, int img_cnt = 0) {
+                     int img_pos = -1, int img_cnt = 0, std::vector<int>* argmax_all = nullptr) {
     bool first = (start_pos == 0);
     std::vector<int> pos3(3 * T);
     if (pos3d_host) std::copy(pos3d_host, pos3d_host + 3 * T, pos3.begin());
@@ -186,8 +186,89 @@ struct Engine::Impl {
     }
     rmsnorm(b.h, w.up_f32(w.LP + "norm.weight"), EPS, b.xn, T, H);
     if (tdir) printf("final:  max_rel=%.2e\n", compare(*tdir + "/ref_final.f32", b.xn, (int64_t)T * H));
+    if (argmax_all) {                                  // per-position argmax (MTP verify)
+      gemm_bf16(b.xn, (const uint16_t*)w.up_raw("lm_head.weight"), m_logits_all, T, VOCAB, H);
+      argmax_all->resize(T);
+      for (int t = 0; t < T; ++t) (*argmax_all)[t] = argmax(m_logits_all + (int64_t)t * VOCAB, VOCAB);
+      return (*argmax_all)[T - 1];
+    }
     gemm_bf16(b.xn + (int64_t)(T - 1) * H, (const uint16_t*)w.up_raw("lm_head.weight"), b.logits, 1, VOCAB, H);
     if (tdir) printf("logits: max_rel=%.2e\n", compare(*tdir + "/ref_logits.f32", b.logits, VOCAB));
+    return argmax(b.logits, VOCAB);
+  }
+
+  // ---- MTP speculative decoding ----
+  // MTP scratch (T=1) + its own attention KV cache.
+  float *m_emb=nullptr,*m_hn=nullptr,*m_en=nullptr,*m_cat=nullptr,*m_x=nullptr,*m_xn=nullptr,*m_tmp=nullptr;
+  float *m_qg=nullptr,*m_q=nullptr,*m_gate=nullptr,*m_k=nullptr,*m_v=nullptr,*m_ao=nullptr,*m_ag=nullptr;
+  float *m_mg=nullptr,*m_mu=nullptr,*m_msw=nullptr,*m_kc=nullptr,*m_vc=nullptr;
+  float *m_logits_all=nullptr, *m_hlast=nullptr, *m_dh=nullptr;
+  std::vector<float*> gst_bak, cst_bak;                // GDN + conv state snapshots
+  int *m_id=nullptr,*m_pos=nullptr;
+  static const int MAXV = 10;                          // max verify tokens (k+1)
+  static const int MAXV_K = MAXV - 1;                  // max draft tokens
+  bool mtp_ready=false;
+
+  void alloc_mtp() {
+    m_emb=dalloc(H); m_hn=dalloc(H); m_en=dalloc(H); m_cat=dalloc(2*H); m_x=dalloc(H); m_xn=dalloc(H); m_tmp=dalloc(H);
+    m_qg=dalloc(NH*2*HD); m_q=dalloc(Q_SIZE); m_gate=dalloc(Q_SIZE); m_k=dalloc(KV_SIZE); m_v=dalloc(KV_SIZE);
+    m_ao=dalloc(Q_SIZE); m_ag=dalloc(Q_SIZE); m_mg=dalloc(INTER); m_mu=dalloc(INTER); m_msw=dalloc(INTER);
+    m_kc=dalloc((int64_t)max_ctx*KV_SIZE); m_vc=dalloc((int64_t)max_ctx*KV_SIZE);
+    cudaMemset(m_kc,0,(int64_t)max_ctx*KV_SIZE*4); cudaMemset(m_vc,0,(int64_t)max_ctx*KV_SIZE*4);
+    m_logits_all=dalloc((int64_t)MAXV*VOCAB); m_hlast=dalloc(H); m_dh=dalloc(H);
+    cudaMalloc(&m_id,sizeof(int)); cudaMalloc(&m_pos,3*sizeof(int));
+    gst_bak.assign(NL,nullptr); cst_bak.assign(NL,nullptr);
+    for (int L=0;L<NL;++L) {
+      if ((L%FA_INT)!=(FA_INT-1)) { gst_bak[L]=dalloc((int64_t)L_VH*L_VD*L_KD); cst_bak[L]=dalloc((int64_t)CC*(CONV-1)); }
+    }
+    mtp_ready = w.st.has("mtp.fc.weight");
+  }
+  void snap_state(bool save) {   // save/restore GDN recurrent + conv state (for rollback)
+    for (int L=0;L<NL;++L) if (gst[L]) {
+      float* a = save?gst_bak[L]:gst[L]; float* b2 = save?gst[L]:gst_bak[L];
+      cudaMemcpy(a,b2,(int64_t)L_VH*L_VD*L_KD*4,cudaMemcpyDeviceToDevice);
+      float* ca = save?cst_bak[L]:cst[L]; float* cb = save?cst[L]:cst_bak[L];
+      cudaMemcpy(ca,cb,(int64_t)CC*(CONV-1)*4,cudaMemcpyDeviceToDevice);
+    }
+  }
+
+  // One MTP step: given the main hidden `h` [1,H] of the token before `last_tok`,
+  // and `last_tok` at sequence position `pos`, predict the next draft token and
+  // write the MTP hidden into `h_out` [1,H] (for chaining). Writes MTP KV at pos.
+  int mtp_step(const float* h, int last_tok, int pos, float* h_out) {
+    std::string M = "mtp.";
+    cudaMemcpy(m_id, &last_tok, 4, cudaMemcpyHostToDevice);
+    embed_gather((const uint16_t*)w.up_raw(w.LP + "embed_tokens.weight"), m_id, m_emb, 1, H);
+    rmsnorm(h, w.up_f32(M + "pre_fc_norm_hidden.weight"), EPS, m_hn, 1, H);
+    rmsnorm(m_emb, w.up_f32(M + "pre_fc_norm_embedding.weight"), EPS, m_en, 1, H);
+    cudaMemcpy(m_cat, m_en, H * 4, cudaMemcpyDeviceToDevice);          // fc = cat([embed, hidden])
+    cudaMemcpy(m_cat + H, m_hn, H * 4, cudaMemcpyDeviceToDevice);
+    w.bf16(m_cat, M + "fc", m_x, 1, H, 2 * H);
+    std::string lp = M + "layers.0.";
+    rmsnorm(m_x, w.up_f32(lp + "input_layernorm.weight"), EPS, m_xn, 1, H);
+    w.bf16(m_xn, lp + "self_attn.q_proj", m_qg, 1, NH * 2 * HD, H);
+    w.bf16(m_xn, lp + "self_attn.k_proj", m_k, 1, KV_SIZE, H);
+    w.bf16(m_xn, lp + "self_attn.v_proj", m_v, 1, KV_SIZE, H);
+    split_qgate(m_qg, m_q, m_gate, 1, NH, HD);
+    rmsnorm(m_q, w.up_f32(lp + "self_attn.q_norm.weight"), EPS, m_q, NH, HD);
+    rmsnorm(m_k, w.up_f32(lp + "self_attn.k_norm.weight"), EPS, m_k, NKV, HD);
+    int p3[3] = {pos, pos, pos}; cudaMemcpy(m_pos, p3, 12, cudaMemcpyHostToDevice);
+    rope_mrope(m_q, m_k, m_pos, 1, NH, NKV, HD, ROT, THETA);
+    cudaMemcpy(m_kc + (int64_t)pos * KV_SIZE, m_k, KV_SIZE * 4, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(m_vc + (int64_t)pos * KV_SIZE, m_v, KV_SIZE * 4, cudaMemcpyDeviceToDevice);
+    attention_cached(m_q, m_kc, m_vc, m_ao, 1, NH, NKV, HD, pos);
+    mul_sigmoid_gate(m_ao, m_gate, m_ag, Q_SIZE);
+    w.bf16(m_ag, lp + "self_attn.o_proj", m_tmp, 1, H, Q_SIZE);
+    add_inplace(m_x, m_tmp, H);
+    rmsnorm(m_x, w.up_f32(lp + "post_attention_layernorm.weight"), EPS, m_xn, 1, H);
+    w.bf16(m_xn, lp + "mlp.gate_proj", m_mg, 1, INTER, H);
+    w.bf16(m_xn, lp + "mlp.up_proj", m_mu, 1, INTER, H);
+    swiglu(m_mg, m_mu, m_msw, INTER);
+    w.bf16(m_msw, lp + "mlp.down_proj", m_tmp, 1, H, INTER);
+    add_inplace(m_x, m_tmp, H);
+    cudaMemcpy(h_out, m_x, H * 4, cudaMemcpyDeviceToDevice);   // MTP hidden for chaining
+    rmsnorm(m_x, w.up_f32(M + "norm.weight"), EPS, m_xn, 1, H);
+    w.bf16(m_xn, "lm_head", b.logits, 1, VOCAB, H);            // shared lm_head
     return argmax(b.logits, VOCAB);
   }
 };
@@ -229,6 +310,7 @@ void Engine::load(const std::string& model_dir, int max_ctx) {
   p_->w.st.open(model_dir + "/model.safetensors");
   p_->b.init(max_ctx);
   p_->alloc_caches();
+  p_->alloc_mtp();
   p_->vt.load(model_dir);
 }
 
@@ -298,6 +380,59 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, int max_new, i
     fprintf(stderr, "[decode] %d tok in %.0f ms = %.1f ms/tok (%.2f tok/s)\n",
             steps, ms, ms / steps, 1000.0 * steps / ms);
   }
+  return out;
+}
+
+// MTP speculative decode: draft k tokens with the chained MTP head, verify all in
+// one main forward, accept the matching prefix (greedy verify => output identical
+// to plain greedy). GDN/conv state is snapshotted and rolled back on rejection.
+std::vector<int> Engine::generate_spec(const std::vector<int>& prompt, int max_new, int eos, int k) {
+  if (!p_->mtp_ready || k < 1) return generate(prompt, max_new, eos);
+  std::vector<int> out;
+  int T = (int)prompt.size(); if (T > p_->max_ctx) T = p_->max_ctx;
+  std::vector<int> pre(prompt.end() - T, prompt.end());
+  int t = p_->forward_tokens(pre, T, 0, nullptr);
+  cudaDeviceSynchronize();
+  // Populate the MTP KV cache over the prompt so drafts can attend to it
+  // (b.h still holds the prompt hiddens here). Position 0 has no predecessor.
+  for (int i = 1; i < T; ++i) p_->mtp_step(p_->b.h + (int64_t)(i - 1) * H, pre[i], i, p_->m_dh);
+  cudaDeviceSynchronize();
+  cudaMemcpy(p_->m_hlast, p_->b.h + (int64_t)(T - 1) * H, H * 4, cudaMemcpyDeviceToDevice);
+  int pos = T, fwds = 0; bool done = false;
+  auto t0 = std::chrono::steady_clock::now();
+  while ((int)out.size() < max_new && !done && pos < p_->max_ctx) {
+    int kk = std::min(k, Impl::MAXV_K);
+    std::vector<int> drafts;
+    { const float* hh = p_->m_hlast; int tok = t, dp = pos;
+      for (int j = 0; j < kk; ++j) { int d = p_->mtp_step(hh, tok, dp, p_->m_dh); drafts.push_back(d); hh = p_->m_dh; tok = d; ++dp; } }
+    p_->snap_state(true);
+    std::vector<int> vids; vids.push_back(t); for (int d : drafts) vids.push_back(d);
+    int VT = (int)vids.size();
+    std::vector<int> p3(3 * VT); for (int a = 0; a < 3; ++a) for (int i = 0; i < VT; ++i) p3[a * VT + i] = pos + i;
+    std::vector<int> preds;
+    p_->forward_tokens(vids, VT, pos, nullptr, p3.data(), nullptr, -1, 0, &preds);
+    cudaDeviceSynchronize(); ++fwds;
+    out.push_back(t); if (t == eos) { done = true; break; }        // commit t (position pos)
+    int n = 0;
+    while (n < (int)drafts.size() && (int)out.size() < max_new && drafts[n] == preds[n]) {
+      out.push_back(drafts[n]); if (drafts[n] == eos) { done = true; break; } ++n;
+    }
+    if (done) break;
+    int correction = preds[n];                                     // becomes next round's t
+    if (n < (int)drafts.size()) {                                  // partial accept -> roll back + re-advance
+      p_->snap_state(false);
+      std::vector<int> adv; adv.push_back(t); for (int i = 0; i < n; ++i) adv.push_back(drafts[i]);
+      int AT = n + 1; std::vector<int> ap3(3 * AT);
+      for (int a = 0; a < 3; ++a) for (int i = 0; i < AT; ++i) ap3[a * AT + i] = pos + i;
+      p_->forward_tokens(adv, AT, pos, nullptr, ap3.data());
+      cudaDeviceSynchronize(); ++fwds;
+    }
+    cudaMemcpy(p_->m_hlast, p_->b.h + (int64_t)n * H, H * 4, cudaMemcpyDeviceToDevice);  // h_{pos+n}
+    t = correction; pos = pos + n + 1;
+  }
+  double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (!out.empty()) fprintf(stderr, "[spec] %zu tok in %.0f ms = %.2f tok/s | %d main forwards (%.2f tok/forward)\n",
+                            out.size(), ms, 1000.0 * out.size() / ms, fwds, (double)out.size() / (fwds ? fwds : 1));
   return out;
 }
 
