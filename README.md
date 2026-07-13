@@ -62,19 +62,34 @@ Every kernel is numerically matched against a reference before it lands.
 | NVFP4 GEMM (Linear) | vs CPU matmul, max_rel 4e-4 |
 | RMSNorm (Gemma) + SwiGLU | bit-exact / 5e-7 |
 | MLP block | `down(silu(gate(x))·up(x))` vs numpy on real weights, max_rel 1e-3 |
+| GDN gated-delta-net | recurrence + gating + gated-norm vs fla, max_rel 2.5e-4 |
+| **full 64-layer forward** | vs FP32 golden dump (`scripts/ref_forward.py`): layer-0 max_rel 2e-4, **greedy next-token exact** |
+| byte-level BPE tokenizer | **35/35 byte-exact** vs HF (EN/中文/code/emoji/…) + ChatML template |
 
-**In progress:** full-attention kernel (RoPE + GQA + q/k-norm + output gate) → GDN
-gated-delta-net recurrence → 64-layer forward → sampling → tokenizer → matching
-vLLM's next-token = working inference.
+**Inference works.** The full native forward (48 GDN + 16 attention layers, NVFP4
+MLP) generates coherent text — `The capital of France is` → `Paris.` — and is
+served through an OpenAI-compatible API.
 
-### Build
+### Build & run
 
 ```bash
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=121   # clang++ host + nvcc device
 cmake --build build -j
-./build/lbload  /path/to/Qwen3.6-27B-NVFP4       # load + validate the checkpoint
-ctest --test-dir build                           # or run ./build/lbtest_*
+./build/lbload   /path/to/Qwen3.6-27B-NVFP4      # load + validate the checkpoint
+./build/lbtest_tok /path/to/Qwen3.6-27B-NVFP4 test/tok_battery.json   # tokenizer
+./build/lbinfer  /path/to/Qwen3.6-27B-NVFP4 test # validate forward vs golden dump
+./build/lbserve  /path/to/Qwen3.6-27B-NVFP4 8080 # OpenAI server on 127.0.0.1:8080
 ```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":16}'
+# {"choices":[{"message":{"role":"assistant","content":"The capital of France is **Paris**."}, ...
+```
+
+`POST /v1/chat/completions` (streaming SSE + non-streaming), `GET /v1/models`,
+`/health`. The engine currently runs a full prefill per token (correctness-first;
+the fast FP4 tensor-core GEMM + KV/state cache are the perf roadmap).
 
 Requires CUDA 13 + clang. Runs on `sm_121` (GB10) only. `clang` cannot emit
 `sm_121` device code directly (knows ≤ CUDA 12.3), so device code goes through
@@ -128,17 +143,32 @@ batch 提升。目标是用更紧的 NVFP4 GEMM + 融合 GDN 状态 kernel + CUD
 | NVFP4 GEMM（Linear） | 对标 CPU 矩阵乘，max_rel 4e-4 |
 | RMSNorm（Gemma）+ SwiGLU | 逐位精确 / 5e-7 |
 | MLP 块 | `down(silu(gate(x))·up(x))` 对标 numpy 真权重，max_rel 1e-3 |
+| GDN 门控 delta-net | 递归 + gating + gated-norm 对标 fla，max_rel 2.5e-4 |
+| **完整 64 层前向** | 对标 FP32 金标（`scripts/ref_forward.py`）：layer-0 max_rel 2e-4，**贪心 next-token 完全一致** |
+| 字节级 BPE 分词器 | 对标 HF **35/35 逐字节精确**（英/中/代码/emoji…）+ ChatML 模板 |
 
-**进行中**：全注意力 kernel（RoPE + GQA + q/k-norm + output gate）→ GDN 门控
-delta-net 递归 → 64 层前向 → 采样 → tokenizer → 对上 vLLM 的 next-token = 可推理。
+**推理已跑通。** 完整原生前向（48 GDN + 16 注意力层，NVFP4 MLP）生成连贯文本
+——`The capital of France is` → `Paris.`——并通过 OpenAI 兼容 API 提供服务。
 
-### 构建
+### 构建与运行
 
 ```bash
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=121   # clang++ host + nvcc device
 cmake --build build -j
-./build/lbload  /path/to/Qwen3.6-27B-NVFP4       # 加载+校验 checkpoint
+./build/lbload   /path/to/Qwen3.6-27B-NVFP4      # 加载+校验 checkpoint
+./build/lbtest_tok /path/to/Qwen3.6-27B-NVFP4 test/tok_battery.json   # 分词器
+./build/lbinfer  /path/to/Qwen3.6-27B-NVFP4 test # 对标金标校验前向
+./build/lbserve  /path/to/Qwen3.6-27B-NVFP4 8080 # OpenAI 服务，127.0.0.1:8080
 ```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"用一句话解释什么是GPU。"}],"max_tokens":40}'
+```
+
+`POST /v1/chat/completions`（流式 SSE + 非流式）、`GET /v1/models`、`/health`。
+当前引擎每个 token 走一次完整 prefill（正确性优先；FP4 tensor-core GEMM 与
+KV/状态缓存是后续性能路线）。
 
 需要 CUDA 13 + clang，仅在 `sm_121`（GB10）上运行。clang 无法直接给 `sm_121`
 出设备码（只认到 CUDA 12.3），所以设备码走 `nvcc -ccbin clang++`。
