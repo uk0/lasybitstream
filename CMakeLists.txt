@@ -86,10 +86,14 @@ target_link_libraries(lbserve PRIVATE CUDA::cudart)
 add_executable(lbtest_vis test/test_vision.cc cuda/vision.cu cuda/forward_ops.cu)
 target_link_libraries(lbtest_vis PRIVATE CUDA::cudart)
 
-set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbserve lbtest_vis PROPERTIES
+# NVMe + RAM hybrid hot-KV cache: verify spill-to-disk + reload integrity.
+add_executable(lbtest_kv test/test_kvcache.cc src/kvcache.cc)
+target_link_libraries(lbtest_kv PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbserve lbtest_vis lbtest_kv PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok lbserve lbtest_vis)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok lbserve lbtest_vis lbtest_kv)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
