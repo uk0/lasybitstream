@@ -65,13 +65,11 @@ add_executable(lbtest_gdn
   cuda/gdn.cu)
 target_link_libraries(lbtest_gdn PRIVATE CUDA::cudart)
 
-# Full native forward pass: the whole Qwen3.6-27B decode end to end.
-add_executable(lbinfer
-  src/infer.cc
-  cuda/nvfp4.cu
-  cuda/ops.cu
-  cuda/gdn.cu
-  cuda/forward_ops.cu)
+# The native engine (checkpoint load + full forward), shared by the CLI + server.
+set(ENGINE_SRC src/engine.cc cuda/nvfp4.cu cuda/ops.cu cuda/gdn.cu cuda/forward_ops.cu)
+
+# Full native forward pass: validate vs the golden dump, or generate.
+add_executable(lbinfer src/infer.cc ${ENGINE_SRC})
 target_link_libraries(lbinfer PRIVATE CUDA::cudart)
 
 # Byte-level BPE tokenizer + chat template (CPU only).
@@ -79,10 +77,14 @@ add_executable(lbtest_tok
   test/test_tokenizer.cc
   src/tokenizer.cc)
 
-set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer PROPERTIES
+# OpenAI-compatible HTTP server: tokenizer + chat template + native engine.
+add_executable(lbserve src/server.cc src/tokenizer.cc ${ENGINE_SRC})
+target_link_libraries(lbserve PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbserve PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok lbserve)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
