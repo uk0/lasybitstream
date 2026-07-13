@@ -36,16 +36,21 @@ add_executable(lbload
   src/loader.cc
   cuda/device.cu)
 
-# NVFP4 dequant kernel correctness test (matches the compressed_tensors reference).
+# NVFP4 kernel correctness tests (match the compressed_tensors / CPU references).
 add_executable(lbtest_nvfp4
   test/test_nvfp4.cc
   cuda/nvfp4.cu)
 target_link_libraries(lbtest_nvfp4 PRIVATE CUDA::cudart)
 
-set_target_properties(lbload lbtest_nvfp4 PROPERTIES
+add_executable(lbtest_gemm
+  test/test_gemm.cc
+  cuda/nvfp4.cu)
+target_link_libraries(lbtest_gemm PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)

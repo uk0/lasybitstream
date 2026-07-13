@@ -13,4 +13,13 @@ namespace lb {
 void dequant_nvfp4(const uint8_t* packed, const uint8_t* scale_fp8, float global_scale,
                    float* out, int64_t rows, int64_t in, int group);
 
+// y = x @ dequant(W)^T, the Linear op every projection uses.
+//   x   : device f32 [M, in]        (activations)
+//   W   : NVFP4 packed [out, in/2] + fp8 scale [out, in/group] + f32 global
+//   y   : device f32 [M, out]
+// Correctness baseline (f32 accumulate, weight dequanted on the fly). The FP4
+// tensor-core path (PTX mma) will be verified against this.
+void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale_fp8,
+                float global_scale, float* y, int M, int64_t out, int64_t in, int group);
+
 }  // namespace lb

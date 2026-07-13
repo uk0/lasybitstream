@@ -47,4 +47,37 @@ void dequant_nvfp4(const uint8_t* packed, const uint8_t* scale, float gscale,
   dequant_nvfp4_kernel<<<grid, block>>>(packed, scale, gscale, out, rows, in, in2, gg, group);
 }
 
+// y[m,o] = sum_i x[m,i] * dequant(W)[o,i]. One thread per output element; the
+// weight row is dequanted on the fly, f32 accumulation. This is the correctness
+// baseline — the FP4 tensor-core (PTX mma) kernel gets verified against it.
+__global__ void gemm_nvfp4_kernel(const float* __restrict__ x, const uint8_t* __restrict__ packed,
+                                  const uint8_t* __restrict__ scale, float gscale,
+                                  float* __restrict__ y, int M, int OUT, int IN,
+                                  int in2, int gg, int group) {
+  int o = blockIdx.x * blockDim.x + threadIdx.x;  // output neuron
+  int m = blockIdx.y * blockDim.y + threadIdx.y;  // batch row
+  if (o >= OUT || m >= M) return;
+  const uint8_t* wrow = packed + (int64_t)o * in2;
+  const uint8_t* srow = scale + (int64_t)o * gg;
+  const float* xrow = x + (int64_t)m * IN;
+  float acc = 0.f;
+  for (int i = 0; i < IN; ++i) {
+    uint8_t byte = wrow[i >> 1];
+    unsigned nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+    float w = (fp4_to_float(nib) * fp8e4m3_to_float(srow[i / group])) / gscale;
+    acc += xrow[i] * w;
+  }
+  y[(int64_t)m * OUT + o] = acc;
+}
+
+void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, float gscale,
+                float* y, int M, int64_t out, int64_t in, int group) {
+  int in2 = (int)(in / 2);
+  int gg = (int)(in / group);
+  dim3 block(64, 4);
+  dim3 grid((unsigned)((out + block.x - 1) / block.x), (unsigned)((M + block.y - 1) / block.y));
+  gemm_nvfp4_kernel<<<grid, block>>>(x, packed, scale, gscale, y, M, (int)out, (int)in,
+                                     in2, gg, group);
+}
+
 }  // namespace lb
