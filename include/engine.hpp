@@ -29,7 +29,8 @@ class Engine {
   // MTP speculative decode: draft `k` tokens per step with the in-checkpoint MTP
   // head and verify them in one main forward. Output is identical to generate()
   // (greedy verify); falls back to generate() if no MTP head is present.
-  std::vector<int> generate_spec(const std::vector<int>& prompt, int max_new, int eos, int k = 4);
+  std::vector<int> generate_spec(const std::vector<int>& prompt, int max_new, int eos, int k = 4,
+                                 const std::function<void(int)>& on_token = nullptr);
 
   // Validation mode: forward once and compare each dumped hidden state against
   // scripts/ref_forward.py's golden files in `test_dir`. Returns argmax.

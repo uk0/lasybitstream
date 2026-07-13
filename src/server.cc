@@ -145,7 +145,7 @@ static void handle_chat(int fd, const Json& req) {
 
   if (!stream) {
     std::vector<int> out = merged > 0 ? g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos)
-                                      : g_eng->generate(ids, max_new, eos);
+                                      : g_eng->generate_spec(ids, max_new, eos, 1);   // MTP = faster
     std::string text = g_tok->decode(out, true);
     std::string body = std::string("{\"id\":\"") + idbuf + "\",\"object\":\"chat.completion\",\"created\":" +
       std::to_string(now_s()) + ",\"model\":\"" + g_model + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" +
@@ -177,7 +177,7 @@ static void handle_chat(int fd, const Json& req) {
     if (end > sent.size()) { sse(full.substr(sent.size(), end - sent.size()), nullptr); sent = full.substr(0, end); }
   };
   if (merged > 0) g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos, cb);
-  else g_eng->generate(ids, max_new, eos, cb);
+  else g_eng->generate_spec(ids, max_new, eos, 1, cb);   // MTP speculative decode (faster single-stream)
   std::string full = g_tok->decode(acc, true);
   if (full.size() > sent.size()) sse(full.substr(sent.size()), nullptr);
   sse("", (int)acc.size() >= max_new ? "length" : "stop");
@@ -209,7 +209,7 @@ static void handle_messages(int fd, const Json& req) {
 
   if (!stream) {
     std::vector<int> out = merged > 0 ? g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos)
-                                      : g_eng->generate(ids, max_new, eos);
+                                      : g_eng->generate_spec(ids, max_new, eos, 1);   // MTP = faster
     std::string text = g_tok->decode(out, true);
     const char* stop_reason = (int)out.size() >= max_new ? "max_tokens" : "end_turn";
     std::string body = std::string("{\"id\":\"") + idbuf + "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" +
@@ -245,7 +245,7 @@ static void handle_messages(int fd, const Json& req) {
     if (end > sent.size()) { emit(full.substr(sent.size(), end - sent.size())); sent = full.substr(0, end); }
   };
   if (merged > 0) g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos, cb);
-  else g_eng->generate(ids, max_new, eos, cb);
+  else g_eng->generate_spec(ids, max_new, eos, 1, cb);   // MTP speculative decode (faster single-stream)
   std::string full = g_tok->decode(acc, true);
   if (full.size() > sent.size()) emit(full.substr(sent.size()));
   ev("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}");

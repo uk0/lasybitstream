@@ -418,8 +418,9 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, int max_new, i
 // MTP speculative decode: draft k tokens with the chained MTP head, verify all in
 // one main forward, accept the matching prefix (greedy verify => output identical
 // to plain greedy). GDN/conv state is snapshotted and rolled back on rejection.
-std::vector<int> Engine::generate_spec(const std::vector<int>& prompt, int max_new, int eos, int k) {
-  if (!p_->mtp_ready || k < 1) return generate(prompt, max_new, eos);
+std::vector<int> Engine::generate_spec(const std::vector<int>& prompt, int max_new, int eos, int k,
+                                       const std::function<void(int)>& on_token) {
+  if (!p_->mtp_ready || k < 1) return generate(prompt, max_new, eos, on_token);
   std::vector<int> out;
   int T = (int)prompt.size(); if (T > p_->max_ctx) T = p_->max_ctx;
   std::vector<int> pre(prompt.end() - T, prompt.end());
@@ -443,10 +444,10 @@ std::vector<int> Engine::generate_spec(const std::vector<int>& prompt, int max_n
     std::vector<int> preds;
     p_->forward_tokens(vids, VT, pos, nullptr, p3.data(), nullptr, -1, 0, &preds, true);  // verify + per-token snapshot
     cudaDeviceSynchronize(); ++fwds;
-    out.push_back(t); if (t == eos) { done = true; break; }        // commit t (position pos)
+    out.push_back(t); if (on_token) on_token(t); if (t == eos) { done = true; break; }   // commit t
     int n = 0;
     while (n < (int)drafts.size() && (int)out.size() < max_new && drafts[n] == preds[n]) {
-      out.push_back(drafts[n]); if (drafts[n] == eos) { done = true; break; } ++n;
+      out.push_back(drafts[n]); if (on_token) on_token(drafts[n]); if (drafts[n] == eos) { done = true; break; } ++n;
     }
     if (done) break;
     int correction = preds[n];                                     // becomes next round's t
