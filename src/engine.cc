@@ -447,7 +447,7 @@ int Engine::validate(const std::vector<int>& ids, const std::string& test_dir) {
 // every weight once regardless of M, so if the GEMMs amortize, tok/s = M/time scales.
 double Engine::bench(int M, int iters) {
   float* x = dalloc((int64_t)M * INTER);
-  float* y = dalloc((int64_t)M * INTER);
+  float* y = dalloc((int64_t)M * VOCAB);               // sized for lm_head's output
   auto run = [&]() {
     for (int L = 0; L < NL; ++L) {
       std::string lp = p_->w.LP + "layers." + std::to_string(L) + ".";
@@ -455,11 +455,13 @@ double Engine::bench(int M, int iters) {
       if (attn) { p_->w.nvfp4(x, lp + "self_attn.q_proj", y, M, NH * 2 * HD, H);
                   p_->w.nvfp4(x, lp + "self_attn.o_proj", y, M, H, Q_SIZE); }
       else { p_->w.bf16(x, lp + "linear_attn.in_proj_qkv", y, M, L_Q * 2 + L_V, H);
+             p_->w.bf16(x, lp + "linear_attn.in_proj_z", y, M, L_V, H);
              p_->w.nvfp4(x, lp + "linear_attn.out_proj", y, M, H, L_V); }
       p_->w.nvfp4(x, lp + "mlp.gate_proj", y, M, INTER, H);
       p_->w.nvfp4(x, lp + "mlp.up_proj", y, M, INTER, H);
       p_->w.nvfp4(x, lp + "mlp.down_proj", y, M, H, INTER);
     }
+    p_->w.bf16(x, "lm_head", y, M, VOCAB, H);            // the untied head (~2.5 GB)
   };
   run(); cudaDeviceSynchronize();                      // warmup
   auto t0 = std::chrono::steady_clock::now();

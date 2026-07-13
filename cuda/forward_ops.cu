@@ -1,6 +1,8 @@
 #include "forward.hpp"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <mma.h>
+#include <cstdlib>
 #include <cfloat>
 
 namespace lb {
@@ -88,8 +90,63 @@ __global__ void gemm_bf16_smallM_kernel(const float* __restrict__ x, const uint1
   }
 }
 
+// Tensor-core (bf16 WMMA) batched BF16 GEMM — same weight-stationary structure as
+// the NVFP4 wmma path but the weights are already bf16 (no dequant). Lifts the M>32
+// cliff for the GDN in-projections and lm_head.
+namespace wmma_bf = nvcuda::wmma;
+static const int NWARP_BF = 8, BMBF = 64;
+__global__ void gemm_bf16_wmma_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                      float* __restrict__ y, int M, int OUT, int IN) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int mt = blockIdx.y * BMBF, nt = (blockIdx.x * NWARP_BF + warp) * 16;
+  __shared__ __nv_bfloat16 As[BMBF * 64];
+  __shared__ __nv_bfloat16 Bs[NWARP_BF][64 * 16];
+  __shared__ float Cs[NWARP_BF][16 * 16];
+  const int MF = BMBF / 16;
+  wmma_bf::fragment<wmma_bf::accumulator, 16, 16, 16, float> cf[MF];
+  #pragma unroll
+  for (int j = 0; j < MF; ++j) wmma_bf::fill_fragment(cf[j], 0.f);
+  for (int k0 = 0; k0 < IN; k0 += 64) {
+    for (int idx = threadIdx.x; idx < BMBF * 64; idx += NWARP_BF * 32) {
+      int m = idx >> 6, kk = idx & 63;
+      As[idx] = (mt + m < M) ? __float2bfloat16(x[(int64_t)(mt + m) * IN + k0 + kk]) : (__nv_bfloat16)0;
+    }
+    for (int i = lane; i < 16 * 64; i += 32) {          // warp stages its bf16 B tile (col-major)
+      int n = i >> 6, kk = i & 63, o = nt + n;
+      Bs[warp][kk + n * 64] = (o < OUT) ? *reinterpret_cast<const __nv_bfloat16*>(&w[(int64_t)o * IN + k0 + kk]) : (__nv_bfloat16)0;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int ks = 0; ks < 64; ks += 16) {
+      wmma_bf::fragment<wmma_bf::matrix_b, 16, 16, 16, __nv_bfloat16, wmma_bf::col_major> bf;
+      wmma_bf::load_matrix_sync(bf, Bs[warp] + ks, 64);
+      #pragma unroll
+      for (int j = 0; j < MF; ++j) {
+        wmma_bf::fragment<wmma_bf::matrix_a, 16, 16, 16, __nv_bfloat16, wmma_bf::row_major> af;
+        wmma_bf::load_matrix_sync(af, As + j * 16 * 64 + ks, 64);
+        wmma_bf::mma_sync(cf[j], af, bf, cf[j]);
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int j = 0; j < MF; ++j) {
+    wmma_bf::store_matrix_sync(Cs[warp], cf[j], 16, wmma_bf::mem_row_major);
+    for (int idx = lane; idx < 256; idx += 32) {
+      int m = idx >> 4, n = idx & 15, row = mt + j * 16 + m;
+      if (row < M && nt + n < OUT) y[(int64_t)row * OUT + nt + n] = Cs[warp][idx];
+    }
+    __syncwarp();
+  }
+}
+
 void gemm_bf16(const float* x, const uint16_t* w, float* y, int M, int OUT, int IN) {
-  if ((IN % 1024) == 0 && M >= 1 && M <= MAXB_BF) {    // weight-stationary GEMV / batch
+  if (M >= 16 && (IN % 64) == 0 && !getenv("LB_NOWMMA")) {   // tensor-core batched path
+    dim3 grid((OUT + NWARP_BF * 16 - 1) / (NWARP_BF * 16), (M + BMBF - 1) / BMBF);
+    gemm_bf16_wmma_kernel<<<grid, NWARP_BF * 32>>>(x, w, y, M, OUT, IN);
+    return;
+  }
+  if ((IN % 1024) == 0 && M >= 1 && M <= MAXB_BF) {    // weight-stationary GEMV / small batch
     const int W = 8;
     int grid = (OUT + W - 1) / W;
     if (M == 1) gemv_bf16_m1_kernel<W><<<grid, W * 32>>>(x, w, y, OUT, IN);
