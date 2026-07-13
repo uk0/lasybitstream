@@ -52,10 +52,17 @@ add_executable(lbtest_ops
   cuda/ops.cu)
 target_link_libraries(lbtest_ops PRIVATE CUDA::cudart)
 
-set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops PROPERTIES
+# Composed MLP block: down(silu(gate(x)) * up(x)) from the NVFP4 GEMM + SwiGLU.
+add_executable(lbtest_mlp
+  test/test_mlp.cc
+  cuda/nvfp4.cu
+  cuda/ops.cu)
+target_link_libraries(lbtest_mlp PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
