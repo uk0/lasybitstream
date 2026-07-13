@@ -22,12 +22,12 @@ performance a bit. Compiled with `clang++` (host) + `nvcc` (device, `-arch=sm_12
 
 | case | throughput |
 |---|---|
-| single-stream decode (greedy, KV cache + hardware FP4 decode) | ~6.8 tok/s |
-| aggregate batch peak (bf16 tensor-core GEMM, batch 32) | ~35 tok/s |
+| single-stream decode (greedy, KV cache + hardware FP4 decode) | ~7 tok/s |
+| aggregate batch (bf16 tensor-core GEMM) | batch 32 → 91, batch 64 → 143, batch 256 → ~216 tok/s |
 
 Single-stream is memory-bandwidth bound (~22 GB of weights read per token ÷ 273 GB/s
 ≈ 12.4 tok/s ceiling); batching raises throughput by serving multiple rows per weight
-sweep. Further pipelining of the tensor-core GEMM is in progress.
+sweep. Further pipelining of the tensor-core GEMM (cp.async double-buffering) is in progress.
 
 ## Verified
 
