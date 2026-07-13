@@ -59,10 +59,16 @@ add_executable(lbtest_mlp
   cuda/ops.cu)
 target_link_libraries(lbtest_mlp PRIVATE CUDA::cudart)
 
-set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp PROPERTIES
+# GDN gated-delta-net recurrence (the 48 linear-attention layers).
+add_executable(lbtest_gdn
+  test/test_gdn.cc
+  cuda/gdn.cu)
+target_link_libraries(lbtest_gdn PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
