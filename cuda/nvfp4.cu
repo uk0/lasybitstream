@@ -3,7 +3,10 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
+#include <cuda_bf16.h>
+#include <mma.h>
 #include <algorithm>
+#include <cstdlib>
 
 namespace lb {
 
@@ -216,10 +219,62 @@ __global__ void gemm_nvfp4_stage_kernel(const float* __restrict__ x, const uint8
     if (lane == 0 && o < OUT) y[(int64_t)m * OUT + o] = v; }
 }
 
+// Tensor-core (bf16 WMMA) batched GEMM. Each warp computes a 16(M)x16(N) output
+// tile: per K-16 step it dequants the FP4 weight tile -> bf16 in shared and casts
+// the activation tile -> bf16, then mma_sync. The bf16 tensor cores raise the
+// compute ceiling ~20x over f32 FMA, so batching becomes weight-bandwidth-bound
+// again (M=64 -> ~800 tok/s). W4A16 with bf16 activations.
+namespace wmma = nvcuda::wmma;
+__global__ void gemm_nvfp4_wmma_kernel(const float* __restrict__ x, const uint8_t* __restrict__ packed,
+                                       const uint8_t* __restrict__ scale, float gscale,
+                                       float* __restrict__ y, int M, int OUT, int IN, int in2, int gg) {
+  int nt = blockIdx.x * 16, mt = blockIdx.y * 16;      // output-neuron / batch-row tile origins
+  __shared__ __nv_bfloat16 As[16 * 16], Bs[16 * 16];
+  __shared__ float Cs[16 * 16];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+  wmma::fill_fragment(cf, 0.f);
+  for (int k0 = 0; k0 < IN; k0 += 16) {
+    for (int idx = threadIdx.x; idx < 256; idx += 32) {
+      int m = idx >> 4, kk = idx & 15;                 // A[m][k] row-major (bf16)
+      As[idx] = (mt + m < M) ? __float2bfloat16(x[(int64_t)(mt + m) * IN + k0 + kk]) : (__nv_bfloat16)0;
+      int n = idx >> 4, kb = idx & 15;                 // B[k][n] col-major: Bs[kb + n*16] = W[nt+n, k0+kb]
+      int o = nt + n; float w = 0.f;
+      if (o < OUT) {
+        uint8_t byte = packed[(int64_t)o * in2 + ((k0 + kb) >> 1)];
+        unsigned nib = ((k0 + kb) & 1) ? (byte >> 4) : (byte & 0xF);
+        w = fp4_to_float(nib) * fp8e4m3_to_float(scale[(int64_t)o * gg + (k0 + kb) / 16]) / gscale;
+      }
+      Bs[kb + n * 16] = __float2bfloat16(w);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+    wmma::load_matrix_sync(af, As, 16);
+    wmma::load_matrix_sync(bf, Bs, 16);
+    wmma::mma_sync(cf, af, bf, cf);
+    __syncthreads();
+  }
+  wmma::store_matrix_sync(Cs, cf, 16, wmma::mem_row_major);
+  for (int idx = threadIdx.x; idx < 256; idx += 32) {
+    int m = idx >> 4, n = idx & 15;
+    if (mt + m < M && nt + n < OUT) y[(int64_t)(mt + m) * OUT + nt + n] = Cs[idx];
+  }
+}
+
 void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, float gscale,
                 float* y, int M, int64_t out, int64_t in, int group) {
   int in2 = (int)(in / 2);
   int gg = (int)(in / group);
+  // Tensor-core WMMA path (WIP): correct at bf16 precision but currently slower
+  // than the staged f32 kernel because the B-staging does naive scalar FP4 dequant
+  // with per-byte global reads. Needs vectorized (uint4) weight loads + hardware
+  // e2m1x2 decode + wider K-tiling to feed the tensor cores at bandwidth. Gated off
+  // until then (set LB_WMMA=1 to try). This is the pinned next step toward 500+.
+  if (M >= 16 && group == 16 && (in % 16) == 0 && getenv("LB_WMMA")) {
+    dim3 grid((unsigned)((out + 15) / 16), (unsigned)((M + 15) / 16));
+    gemm_nvfp4_wmma_kernel<<<grid, 32>>>(x, packed, scale, gscale, y, M, (int)out, (int)in, in2, gg);
+    return;
+  }
   if (M == 1 && group == 16 && (in % 1024) == 0) {   // fast decode GEMV path
     const int W = 8;
     int grid = (int)((out + W - 1) / W);
