@@ -13,6 +13,7 @@
 #include <map>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 
 namespace lb {
 
@@ -281,7 +282,8 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, int max_new, i
   std::vector<int> pre(prompt.end() - T, prompt.end());
   int nxt = p_->forward_tokens(pre, T, 0, nullptr);   // prefill the prompt, build caches
   cudaDeviceSynchronize();
-  int pos = T;
+  int pos = T, steps = 0;
+  auto t0 = std::chrono::steady_clock::now();
   for (int s = 0; s < max_new; ++s) {
     if (nxt == eos || pos >= p_->max_ctx) break;
     out.push_back(nxt);
@@ -289,7 +291,12 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, int max_new, i
     int cur = nxt;
     nxt = p_->forward_tokens({cur}, 1, pos, nullptr);  // incremental decode of one token
     cudaDeviceSynchronize();
-    ++pos;
+    ++pos; ++steps;
+  }
+  if (steps > 0) {
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "[decode] %d tok in %.0f ms = %.1f ms/tok (%.2f tok/s)\n",
+            steps, ms, ms / steps, 1000.0 * steps / ms);
   }
   return out;
 }
