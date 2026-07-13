@@ -346,11 +346,11 @@ __global__ void argmax_kernel(const float* __restrict__ x, int n, int* __restric
   if (threadIdx.x == 0) *idx = si[0];
 }
 int argmax(const float* x_dev, int n) {
-  int* d_idx; cudaMalloc(&d_idx, sizeof(int));
+  static int* d_idx = nullptr;                 // persistent — avoid malloc/free (+sync) per call
+  if (!d_idx) cudaMalloc(&d_idx, sizeof(int));
   int block = 256;
   argmax_kernel<<<1, block, block * (sizeof(float) + sizeof(int))>>>(x_dev, n, d_idx);
   int h_idx; cudaMemcpy(&h_idx, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaFree(d_idx);
   return h_idx;
 }
 
