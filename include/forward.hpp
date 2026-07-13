@@ -22,6 +22,14 @@ void causal_conv1d_silu(const float* x, const uint16_t* w_bf16, float* out, int 
 void rope_partial(float* q, float* k, const int* pos, int T, int NH, int NKV, int HD,
                   int rot, float theta);
 
+// Interleaved M-RoPE: like rope_partial but each rotary pair i uses position
+// pos3d[(i%3)*T + t] (axis 0/1/2 = t/h/w). pos3d is [3, T]. For text tokens the
+// three rows are equal, so this reduces exactly to rope_partial (1D). Needed for
+// image tokens, whose h/w positions differ. mrope_section is fixed [11,11,10]
+// which is exactly axis = pair % 3 over the 32 pairs.
+void rope_mrope(float* q, float* k, const int* pos3d, int T, int NH, int NKV, int HD,
+                int rot, float theta);
+
 // GQA causal self-attention. q [T,NH,HD], k/v [T,NKV,HD] -> out [T,NH,HD].
 // scale = HD^-0.5, causal mask, NH/NKV query heads share each kv head.
 void attention_gqa(const float* q, const float* k, const float* v, float* out,

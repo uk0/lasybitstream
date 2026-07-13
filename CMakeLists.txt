@@ -65,8 +65,9 @@ add_executable(lbtest_gdn
   cuda/gdn.cu)
 target_link_libraries(lbtest_gdn PRIVATE CUDA::cudart)
 
-# The native engine (checkpoint load + full forward), shared by the CLI + server.
-set(ENGINE_SRC src/engine.cc cuda/nvfp4.cu cuda/ops.cu cuda/gdn.cu cuda/forward_ops.cu)
+# The native engine (checkpoint load + full forward + vision tower), shared by CLI + server.
+set(ENGINE_SRC src/engine.cc src/vision_tower.cc
+    cuda/nvfp4.cu cuda/ops.cu cuda/gdn.cu cuda/forward_ops.cu cuda/vision.cu)
 
 # Full native forward pass: validate vs the golden dump, or generate.
 add_executable(lbinfer src/infer.cc ${ENGINE_SRC})

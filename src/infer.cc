@@ -12,9 +12,31 @@ using namespace lb;
 int main(int argc, char** argv) {
   std::string mdir = argc > 1 ? argv[1] : "/model";
   std::string tdir = argc > 2 ? argv[2] : "test";
-  int gen = 0;
-  for (int i = 3; i < argc; ++i)
+  int gen = 0; bool mm = false;
+  for (int i = 3; i < argc; ++i) {
     if (std::string(argv[i]) == "gen" && i + 1 < argc) gen = atoi(argv[i + 1]);
+    if (std::string(argv[i]) == "mm") mm = true;
+  }
+
+  if (mm) {  // multimodal: reference image (vis_pixels/grid) + prompt (vis_input_ids)
+    std::vector<int> ids; std::vector<float> pix; int g[3] = {1, 0, 0};
+    { FILE* f = fopen((tdir + "/vis_input_ids.i32").c_str(), "rb"); int x;
+      while (f && fread(&x, 4, 1, f) == 1) ids.push_back(x); if (f) fclose(f); }
+    { FILE* f = fopen((tdir + "/vis_grid.i32").c_str(), "rb"); if (f) { fread(g, 4, 3, f); fclose(f); } }
+    { FILE* f = fopen((tdir + "/vis_pixels.f32").c_str(), "rb"); if (f) {
+        fseek(f, 0, SEEK_END); long nb = ftell(f); fseek(f, 0, SEEK_SET);
+        pix.resize(nb / 4); fread(pix.data(), 4, pix.size(), f); fclose(f); } }
+    if (ids.empty() || pix.empty()) { printf("need vis_input_ids.i32 + vis_pixels.f32 + vis_grid.i32\n"); return 2; }
+    printf("mm: image grid t=%d h=%d w=%d, prompt %zu tokens\n", g[0], g[1], g[2], ids.size());
+    Engine eng; eng.load(mdir, ids.size() + 40);
+    int merged = eng.encode_image(pix, g[0], g[1], g[2]);
+    printf("encoded %d image tokens\n", merged);
+    std::vector<int> o = eng.generate_mm(ids, 248056, g[1], g[2], gen > 0 ? gen : 24, 248046);
+    std::vector<int> all = ids; for (int t : o) all.push_back(t);
+    FILE* f = fopen((tdir + "/mm_gen_ids.i32").c_str(), "wb"); fwrite(o.data(), 4, o.size(), f); fclose(f);
+    printf("mm generated:"); for (int t : o) printf(" %d", t); printf("\nwrote %s/mm_gen_ids.i32\n", tdir.c_str());
+    return 0;
+  }
 
   std::vector<int> ids;
   { FILE* f = fopen((tdir + "/ref_tokens.i32").c_str(), "rb");

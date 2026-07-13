@@ -30,6 +30,16 @@ class Engine {
   // scripts/ref_forward.py's golden files in `test_dir`. Returns argmax.
   int validate(const std::vector<int>& ids, const std::string& test_dir);
 
+  // --- vision / multimodal ---
+  // Encode one image's preprocessed patches `pixels` [t*h*w, 1536] into image
+  // embeddings held by the engine. Returns the merged image-token count.
+  int encode_image(const std::vector<float>& pixels, int t, int h, int w);
+  // Generate for a prompt containing a run of `img_token_id` pads; splices the
+  // previously encoded image embeddings over the pads and uses image M-RoPE.
+  std::vector<int> generate_mm(const std::vector<int>& prompt, int img_token_id, int gh, int gw,
+                               int max_new, int eos,
+                               const std::function<void(int)>& on_token = nullptr);
+
   int max_ctx() const;
 
  private:

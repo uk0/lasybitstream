@@ -123,6 +123,30 @@ void rope_partial(float* q, float* k, const int* pos, int T, int NH, int NKV, in
   rope_kernel<<<gk, block>>>(k, pos, T, NKV, HD, rot, theta);
 }
 
+// interleaved M-RoPE: rotary pair i uses pos3d[(i%3)*T + t].
+__global__ void rope_mrope_kernel(float* __restrict__ t_arr, const int* __restrict__ pos3d,
+                                  int T, int NHEADS, int HD, int rot, float theta) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;   // rotary pair index
+  int h = blockIdx.y, t = blockIdx.z;
+  int half = rot / 2;
+  if (i >= half || h >= NHEADS || t >= T) return;
+  float* base = t_arr + (((int64_t)t * NHEADS + h) * HD);
+  int axis = i % 3;                                // 0/1/2 = t/h/w  (== mrope_section [11,11,10])
+  float freq = __powf(theta, -2.f * i / rot);
+  float ang = pos3d[axis * T + t] * freq;
+  float c = __cosf(ang), s = __sinf(ang);
+  float a = base[i], b = base[i + half];
+  base[i] = a * c - b * s;
+  base[i + half] = b * c + a * s;
+}
+void rope_mrope(float* q, float* k, const int* pos3d, int T, int NH, int NKV, int HD,
+                int rot, float theta) {
+  int half = rot / 2;
+  dim3 block(32);
+  rope_mrope_kernel<<<dim3((half + 31) / 32, NH, T), block>>>(q, pos3d, T, NH, HD, rot, theta);
+  rope_mrope_kernel<<<dim3((half + 31) / 32, NKV, T), block>>>(k, pos3d, T, NKV, HD, rot, theta);
+}
+
 // ---- GQA causal attention ----
 // one block per (head, query token); threads cooperate over HD / keys.
 __global__ void attention_kernel(const float* __restrict__ q, const float* __restrict__ k,
