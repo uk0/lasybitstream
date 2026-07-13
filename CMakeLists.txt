@@ -81,10 +81,14 @@ add_executable(lbtest_tok
 add_executable(lbserve src/server.cc src/tokenizer.cc ${ENGINE_SRC})
 target_link_libraries(lbserve PRIVATE CUDA::cudart)
 
-set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbserve PROPERTIES
+# Vision tower (model.visual.* ViT): verify merged image embeddings vs the golden dump.
+add_executable(lbtest_vis test/test_vision.cc cuda/vision.cu cuda/forward_ops.cu)
+target_link_libraries(lbtest_vis PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbserve lbtest_vis PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok lbserve)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok lbserve lbtest_vis)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
