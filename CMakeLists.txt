@@ -47,10 +47,15 @@ add_executable(lbtest_gemm
   cuda/nvfp4.cu)
 target_link_libraries(lbtest_gemm PRIVATE CUDA::cudart)
 
-set_target_properties(lbload lbtest_nvfp4 lbtest_gemm PROPERTIES
+add_executable(lbtest_ops
+  test/test_ops.cc
+  cuda/ops.cu)
+target_link_libraries(lbtest_ops PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
