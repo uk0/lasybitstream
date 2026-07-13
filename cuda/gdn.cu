@@ -58,8 +58,8 @@ __global__ void gdn_recurrence_kernel(const float* __restrict__ q, const float* 
 
 void gdn_recurrence(const float* q, const float* k, const float* v, const float* g,
                     const float* beta, float scale, float* out, float* state,
-                    int T, int HK, int HV, int DK, int DV) {
-  cudaMemset(state, 0, (size_t)HV * DV * DK * sizeof(float));
+                    int T, int HK, int HV, int DK, int DV, bool reset) {
+  if (reset) cudaMemset(state, 0, (size_t)HV * DV * DK * sizeof(float));
   int block = DV;  // one thread per state row
   size_t shmem = (2 * DK + block) * sizeof(float);
   gdn_recurrence_kernel<<<HV, block, shmem>>>(q, k, v, g, beta, scale, out, state,

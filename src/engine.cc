@@ -99,9 +99,26 @@ struct Engine::Impl {
   Weights w;
   Buf b;
   int max_ctx = 4096;
+  static const int CC = L_Q * 2 + L_V;                 // 10240 GDN conv channels
+  std::vector<float*> kc, vc, gst, cst;                // per-layer caches (NL entries)
 
-  int forward(const std::vector<int>& ids, int T, const std::string* tdir) {
-    std::vector<int> pos(T); for (int i = 0; i < T; ++i) pos[i] = i;
+  void alloc_caches() {
+    kc.assign(NL, nullptr); vc.assign(NL, nullptr); gst.assign(NL, nullptr); cst.assign(NL, nullptr);
+    for (int L = 0; L < NL; ++L) {
+      if ((L % FA_INT) == (FA_INT - 1)) {
+        kc[L] = dalloc((int64_t)max_ctx * NKV * HD); vc[L] = dalloc((int64_t)max_ctx * NKV * HD);
+      } else {
+        gst[L] = dalloc((int64_t)L_VH * L_VD * L_KD); cst[L] = dalloc((int64_t)CC * (CONV - 1));
+      }
+    }
+  }
+
+  // Forward `T` new tokens starting at global position `start_pos`, using and
+  // updating the K/V + GDN-state + conv-state caches. `first = (start_pos == 0)`
+  // means a fresh sequence (prefill). Returns the greedy next token.
+  int forward_tokens(const std::vector<int>& ids, int T, int start_pos, const std::string* tdir) {
+    bool first = (start_pos == 0);
+    std::vector<int> pos(T); for (int i = 0; i < T; ++i) pos[i] = start_pos + i;
     cudaMemcpy(b.ids_d, ids.data(), T * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(b.pos_d, pos.data(), T * 4, cudaMemcpyHostToDevice);
     embed_gather((const uint16_t*)w.up_raw(w.LP + "embed_tokens.weight"), b.ids_d, b.h, T, H);
@@ -120,22 +137,24 @@ struct Engine::Impl {
         rmsnorm(b.aq, w.up_f32(ap + ".q_norm.weight"), EPS, b.aq, T * NH, HD);
         rmsnorm(b.ak, w.up_f32(ap + ".k_norm.weight"), EPS, b.ak, T * NKV, HD);
         rope_partial(b.aq, b.ak, b.pos_d, T, NH, NKV, HD, ROT, THETA);
-        attention_gqa(b.aq, b.ak, b.av, b.aout, T, NH, NKV, HD);
+        // append new k,v to the cache, then attend over [0, start_pos+T)
+        cudaMemcpy(kc[L] + (int64_t)start_pos * KV_SIZE, b.ak, (int64_t)T * KV_SIZE * 4, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(vc[L] + (int64_t)start_pos * KV_SIZE, b.av, (int64_t)T * KV_SIZE * 4, cudaMemcpyDeviceToDevice);
+        attention_cached(b.aq, kc[L], vc[L], b.aout, T, NH, NKV, HD, start_pos);
         mul_sigmoid_gate(b.aout, b.agate, b.agated, T * Q_SIZE);
         w.nvfp4(b.agated, ap + ".o_proj", b.mix, T, H, Q_SIZE);
       } else {
         std::string gp = lp + "linear_attn";
-        w.bf16(b.xn, gp + ".in_proj_qkv", b.qkv, T, L_Q * 2 + L_V, H);
+        w.bf16(b.xn, gp + ".in_proj_qkv", b.qkv, T, CC, H);
         w.bf16(b.xn, gp + ".in_proj_z", b.z, T, L_V, H);
         w.bf16(b.xn, gp + ".in_proj_a", b.ga, T, L_VH, H);
         w.bf16(b.xn, gp + ".in_proj_b", b.gb, T, L_VH, H);
-        causal_conv1d_silu(b.qkv, (const uint16_t*)w.up_raw(gp + ".conv1d.weight"), b.conv, T, L_Q * 2 + L_V, CONV);
-        int C = L_Q * 2 + L_V;
-        cudaMemcpy2D(b.q, L_Q * 4, b.conv, C * 4, L_Q * 4, T, cudaMemcpyDeviceToDevice);
-        cudaMemcpy2D(b.k, L_Q * 4, b.conv + L_Q, C * 4, L_Q * 4, T, cudaMemcpyDeviceToDevice);
-        cudaMemcpy2D(b.v, L_V * 4, b.conv + 2 * L_Q, C * 4, L_V * 4, T, cudaMemcpyDeviceToDevice);
+        causal_conv1d_state_silu(b.qkv, cst[L], (const uint16_t*)w.up_raw(gp + ".conv1d.weight"), b.conv, T, CC, CONV, first);
+        cudaMemcpy2D(b.q, L_Q * 4, b.conv, CC * 4, L_Q * 4, T, cudaMemcpyDeviceToDevice);
+        cudaMemcpy2D(b.k, L_Q * 4, b.conv + L_Q, CC * 4, L_Q * 4, T, cudaMemcpyDeviceToDevice);
+        cudaMemcpy2D(b.v, L_V * 4, b.conv + 2 * L_Q, CC * 4, L_V * 4, T, cudaMemcpyDeviceToDevice);
         gdn_gating(w.up_f32(gp + ".A_log"), b.ga, b.gb, w.up_f32(gp + ".dt_bias"), b.g, b.beta, T, L_VH);
-        gdn_recurrence(b.q, b.k, b.v, b.g, b.beta, scale_gdn, b.recur, b.state, T, L_KH, L_VH, L_KD, L_VD);
+        gdn_recurrence(b.q, b.k, b.v, b.g, b.beta, scale_gdn, b.recur, gst[L], T, L_KH, L_VH, L_KD, L_VD, first);
         rmsnorm_gated(b.recur, w.up_f32(gp + ".norm.weight"), b.z, EPS, b.gated, T * L_VH, L_VD);
         w.nvfp4(b.gated, gp + ".out_proj", b.mix, T, H, L_V);
       }
@@ -167,33 +186,41 @@ void Engine::load(const std::string& model_dir, int max_ctx) {
   p_->max_ctx = max_ctx;
   p_->w.st.open(model_dir + "/model.safetensors");
   p_->b.init(max_ctx);
+  p_->alloc_caches();
 }
 
 int Engine::next_token(const std::vector<int>& ids) {
   int T = (int)ids.size();
   if (T > p_->max_ctx) T = p_->max_ctx;
   std::vector<int> in(ids.end() - T, ids.end());
-  int r = p_->forward(in, T, nullptr);
+  int r = p_->forward_tokens(in, T, 0, nullptr);   // one-shot prefill
   cudaDeviceSynchronize();
   return r;
 }
 
 std::vector<int> Engine::generate(const std::vector<int>& prompt, int max_new, int eos,
                                   const std::function<void(int)>& on_token) {
-  std::vector<int> ids = prompt, out;
+  std::vector<int> out;
+  int T = (int)prompt.size();
+  if (T > p_->max_ctx) T = p_->max_ctx;
+  std::vector<int> pre(prompt.end() - T, prompt.end());
+  int nxt = p_->forward_tokens(pre, T, 0, nullptr);   // prefill the prompt, build caches
+  cudaDeviceSynchronize();
+  int pos = T;
   for (int s = 0; s < max_new; ++s) {
-    if ((int)ids.size() >= p_->max_ctx) break;
-    int nxt = p_->forward(ids, (int)ids.size(), nullptr);
-    cudaDeviceSynchronize();
-    if (nxt == eos) break;
-    ids.push_back(nxt); out.push_back(nxt);
+    if (nxt == eos || pos >= p_->max_ctx) break;
+    out.push_back(nxt);
     if (on_token) on_token(nxt);
+    int cur = nxt;
+    nxt = p_->forward_tokens({cur}, 1, pos, nullptr);  // incremental decode of one token
+    cudaDeviceSynchronize();
+    ++pos;
   }
   return out;
 }
 
 int Engine::validate(const std::vector<int>& ids, const std::string& test_dir) {
-  int r = p_->forward(ids, (int)ids.size(), &test_dir);
+  int r = p_->forward_tokens(ids, (int)ids.size(), 0, &test_dir);
   cudaDeviceSynchronize();
   return r;
 }

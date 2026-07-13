@@ -27,6 +27,18 @@ void rope_partial(float* q, float* k, const int* pos, int T, int NH, int NKV, in
 void attention_gqa(const float* q, const float* k, const float* v, float* out,
                    int T, int NH, int NKV, int HD);
 
+// Cached (incremental) GQA attention: T new query tokens attend over a K/V cache
+// of length start_pos+T. Query i (global position start_pos+i) attends keys
+// 0..start_pos+i (causal). kc/vc are [start_pos+T, NKV, HD] (k already RoPE'd).
+void attention_cached(const float* q, const float* kc, const float* vc, float* out,
+                      int T, int NH, int NKV, int HD, int start_pos);
+
+// Depthwise causal conv1d (kernel K) + SiLU with a carried state. `state` holds
+// the previous K-1 inputs per channel [C,K-1] (updated in place); when `first`
+// the state is treated as zero (fresh sequence). x [T,C] -> out [T,C].
+void causal_conv1d_state_silu(const float* x, float* state, const uint16_t* w_bf16,
+                              float* out, int T, int C, int K, bool first);
+
 // Per-head split of the fused q/gate projection: in [T,NH,2*HD] (per head [q(HD)|gate(HD)])
 // -> q [T,NH,HD], gate [T,NH,HD].
 void split_qgate(const float* qg, float* q, float* gate, int T, int NH, int HD);

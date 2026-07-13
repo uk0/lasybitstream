@@ -132,6 +132,68 @@ void attention_gqa(const float* q, const float* k, const float* v, float* out,
   attention_kernel<<<grid, block, shmem>>>(q, k, v, out, T, NH, NKV, HD);
 }
 
+// ---- cached (incremental) GQA attention ----
+// one block per (head, new-query i); threads == HD, online softmax over the cache.
+__global__ void attention_cached_kernel(const float* __restrict__ q, const float* __restrict__ kc,
+                                        const float* __restrict__ vc, float* __restrict__ out,
+                                        int T, int NH, int NKV, int HD, int start_pos) {
+  int h = blockIdx.x;        // query head
+  int i = blockIdx.y;        // new-query index [0,T)
+  if (h >= NH || i >= T) return;
+  int kvh = h / (NH / NKV);
+  int lane = threadIdx.x;    // 0..HD-1
+  extern __shared__ float sh[];
+  float* qsh = sh; float* red = sh + HD;
+  qsh[lane] = q[(((int64_t)i * NH + h) * HD) + lane];
+  __syncthreads();
+  float scale = rsqrtf((float)HD);
+  int limit = start_pos + i;   // inclusive causal bound in the cache
+  float m = -FLT_MAX, l = 0.f, acc = 0.f;
+  for (int tk = 0; tk <= limit; ++tk) {
+    const float* kv = kc + (((int64_t)tk * NKV + kvh) * HD);
+    red[lane] = qsh[lane] * kv[lane];
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] += red[lane + s]; __syncthreads(); }
+    float score = red[0] * scale;
+    __syncthreads();
+    float mn = fmaxf(m, score), corr = __expf(m - mn), p = __expf(score - mn);
+    l = l * corr + p;
+    acc = acc * corr + p * vc[(((int64_t)tk * NKV + kvh) * HD) + lane];
+    m = mn;
+  }
+  out[(((int64_t)i * NH + h) * HD) + lane] = acc / l;
+}
+void attention_cached(const float* q, const float* kc, const float* vc, float* out,
+                      int T, int NH, int NKV, int HD, int start_pos) {
+  dim3 block(HD), grid(NH, T);
+  attention_cached_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, out, T, NH, NKV, HD, start_pos);
+}
+
+// ---- depthwise causal conv1d + SiLU with carried state ----
+// one thread per channel, sequential over the T new tokens, sliding a K-1 window.
+__global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restrict__ state,
+                                    const uint16_t* __restrict__ w, float* __restrict__ out,
+                                    int T, int C, int K, int first) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  float hist[8];                                  // K-1 previous inputs, oldest..newest
+  for (int m = 0; m < K - 1; ++m) hist[m] = first ? 0.f : state[(int64_t)c * (K - 1) + m];
+  for (int t = 0; t < T; ++t) {
+    float cur = x[(int64_t)t * C + c];
+    float acc = bf16f(w[(int64_t)c * K + (K - 1)]) * cur;
+    for (int j = 0; j < K - 1; ++j) acc += bf16f(w[(int64_t)c * K + j]) * hist[j];
+    out[(int64_t)t * C + c] = siluf(acc);
+    for (int m = 0; m < K - 2; ++m) hist[m] = hist[m + 1];
+    hist[K - 2] = cur;
+  }
+  for (int m = 0; m < K - 1; ++m) state[(int64_t)c * (K - 1) + m] = hist[m];
+}
+void causal_conv1d_state_silu(const float* x, float* state, const uint16_t* w, float* out,
+                              int T, int C, int K, bool first) {
+  int block = 256, grid = (C + block - 1) / block;
+  conv1d_state_kernel<<<grid, block>>>(x, state, w, out, T, C, K, first ? 1 : 0);
+}
+
 // ---- per-head q/gate split ----
 __global__ void split_qgate_kernel(const float* __restrict__ qg, float* __restrict__ q,
                                    float* __restrict__ gate, int T, int NH, int HD) {

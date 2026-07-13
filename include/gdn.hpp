@@ -11,11 +11,14 @@ namespace lb {
 //   q,k : [T, num_k_heads, head_k]     v : [T, num_v_heads, head_v]
 //   g,beta : [T, num_v_heads]          out : [T, num_v_heads, head_v]
 // GQA: v-head hv uses k-head hv / (num_v_heads / num_k_heads).
-// `state` is a device scratch buffer [num_v_heads * head_v * head_k], zeroed here.
+// `state` is a device buffer [num_v_heads * head_v * head_k]. When `reset` is
+// true it is zeroed first (fresh sequence / prefill); when false the recurrence
+// continues from the existing state (incremental decode with a carried cache).
 void gdn_recurrence(const float* q, const float* k, const float* v,
                     const float* g, const float* beta, float scale,
                     float* out, float* state,
-                    int T, int num_k_heads, int num_v_heads, int head_k, int head_v);
+                    int T, int num_k_heads, int num_v_heads, int head_k, int head_v,
+                    bool reset = true);
 
 // GDN gating: g = -exp(A_log) * softplus(a + dt_bias),  beta = sigmoid(b).
 //   A_log, dt_bias : [num_v_heads]     a, b : [T, num_v_heads]
