@@ -54,11 +54,45 @@ __global__ void gemv_bf16_m1_kernel(const float* __restrict__ x, const uint16_t*
   if (lane == 0 && o < OUT) y[o] = acc;
 }
 
+// Weight-stationary small-batch BF16 GEMM (2..8 rows): weight row loaded once,
+// reused across M activation vectors. Bandwidth-bound in the weights.
+template <int WARPS>
+__global__ void gemm_bf16_smallM_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                        float* __restrict__ y, int M, int OUT, int IN) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int o = blockIdx.x * WARPS + warp;
+  if (o >= OUT) return;
+  const uint16_t* wr = w + (int64_t)o * IN;
+  float acc[8]; for (int m = 0; m < M; ++m) acc[m] = 0.f;
+  for (int k0 = 0; k0 < IN; k0 += 1024) {
+    int col = k0 + lane * 32;
+    const uint4* wp = reinterpret_cast<const uint4*>(wr + col);
+    float wv[32];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) { uint4 pk = wp[u]; const uint16_t* hh = reinterpret_cast<const uint16_t*>(&pk);
+      #pragma unroll
+      for (int t = 0; t < 8; ++t) wv[u * 8 + t] = bf16f(hh[t]); }
+    for (int m = 0; m < M; ++m) {
+      const float* xr = x + (int64_t)m * IN + col;
+      float a = 0.f;
+      #pragma unroll
+      for (int c = 0; c < 32; ++c) a += xr[c] * wv[c];
+      acc[m] += a;
+    }
+  }
+  for (int m = 0; m < M; ++m) {
+    float v = acc[m];
+    for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffffu, v, d);
+    if (lane == 0) y[(int64_t)m * OUT + o] = v;
+  }
+}
+
 void gemm_bf16(const float* x, const uint16_t* w, float* y, int M, int OUT, int IN) {
-  if (M == 1 && (IN % 1024) == 0) {              // fast decode GEMV path
+  if ((IN % 1024) == 0 && M >= 1 && M <= 8) {    // weight-stationary GEMV / small batch
     const int W = 8;
     int grid = (OUT + W - 1) / W;
-    gemv_bf16_m1_kernel<W><<<grid, W * 32>>>(x, w, y, OUT, IN);
+    if (M == 1) gemv_bf16_m1_kernel<W><<<grid, W * 32>>>(x, w, y, OUT, IN);
+    else gemm_bf16_smallM_kernel<W><<<grid, W * 32>>>(x, w, y, M, OUT, IN);
     return;
   }
   dim3 block(256), grid((OUT + 255) / 256, M);

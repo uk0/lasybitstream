@@ -115,6 +115,47 @@ __global__ void gemv_nvfp4_m1_kernel(const float* __restrict__ x, const uint8_t*
   if (lane == 0 && o < OUT) y[o] = acc;
 }
 
+// Weight-stationary small-batch GEMM (2..8 rows): one warp per output row loads
+// each packed weight ONCE (uint4), unpacks to registers, and dots it against all
+// M activation vectors (L2-resident). Bandwidth-bound in the weights regardless of
+// M — this is what makes the MTP verify (M=k+1) and short prefills fast.
+template <int WARPS>
+__global__ void gemm_nvfp4_smallM_kernel(const float* __restrict__ x, const uint8_t* __restrict__ packed,
+                                         const uint8_t* __restrict__ scale, float gscale,
+                                         float* __restrict__ y, int M, int OUT, int IN, int in2, int gg) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int o = blockIdx.x * WARPS + warp;
+  if (o >= OUT) return;
+  const uint8_t* wr = packed + (int64_t)o * in2;
+  const uint8_t* sr = scale + (int64_t)o * gg;
+  float acc[8]; for (int m = 0; m < M; ++m) acc[m] = 0.f;
+  for (int k0 = 0; k0 < IN; k0 += 1024) {
+    int col = k0 + lane * 32;
+    uint4 p = *reinterpret_cast<const uint4*>(wr + (col >> 1));
+    uint16_t raw2 = *reinterpret_cast<const uint16_t*>(sr + (col >> 4));
+    float s0 = fp8e4m3_to_float((uint8_t)(raw2 & 0xff)) / gscale;
+    float s1 = fp8e4m3_to_float((uint8_t)(raw2 >> 8)) / gscale;
+    float wv[32];
+    #pragma unroll
+    for (int b = 0; b < 16; ++b) {
+      uint8_t byte = get_byte(p, b); float s = (b < 8) ? s0 : s1;
+      wv[2 * b] = fp4_to_float(byte & 0xF) * s; wv[2 * b + 1] = fp4_to_float(byte >> 4) * s;
+    }
+    for (int m = 0; m < M; ++m) {
+      const float* xr = x + (int64_t)m * IN + col;
+      float a = 0.f;
+      #pragma unroll
+      for (int c = 0; c < 32; ++c) a += xr[c] * wv[c];
+      acc[m] += a;
+    }
+  }
+  for (int m = 0; m < M; ++m) {
+    float v = acc[m];
+    for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffffu, v, d);
+    if (lane == 0) y[(int64_t)m * OUT + o] = v;
+  }
+}
+
 void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, float gscale,
                 float* y, int M, int64_t out, int64_t in, int group) {
   int in2 = (int)(in / 2);
@@ -123,6 +164,12 @@ void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, flo
     const int W = 8;
     int grid = (int)((out + W - 1) / W);
     gemv_nvfp4_m1_kernel<W><<<grid, W * 32>>>(x, packed, scale, gscale, y, (int)out, (int)in, in2, gg);
+    return;
+  }
+  if (M >= 2 && M <= 8 && group == 16 && (in % 1024) == 0) {   // weight-stationary small batch
+    const int W = 8;
+    int grid = (int)((out + W - 1) / W);
+    gemm_nvfp4_smallM_kernel<W><<<grid, W * 32>>>(x, packed, scale, gscale, y, M, (int)out, (int)in, in2, gg);
     return;
   }
   dim3 block(64, 4);
