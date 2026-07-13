@@ -119,7 +119,8 @@ struct Engine::Impl {
     if (kc.empty()) return;                            // never loaded
     b.free();
     for (int L = 0; L < NL; ++L) { cudaFree(kc[L]); cudaFree(vc[L]); cudaFree(gst[L]); cudaFree(cst[L]);
-      if (L < (int)gst_bak.size()) { cudaFree(gst_bak[L]); cudaFree(cst_bak[L]); } }
+      if (L < (int)gst_bak.size()) { cudaFree(gst_bak[L]); cudaFree(cst_bak[L]); }
+      if (L < (int)gdn_snap.size()) { cudaFree(gdn_snap[L]); cudaFree(conv_snap[L]); } }
     for (float* p : {m_emb, m_hn, m_en, m_cat, m_x, m_xn, m_tmp, m_qg, m_q, m_gate, m_k, m_v, m_ao,
                      m_ag, m_mg, m_mu, m_msw, m_kc, m_vc, m_logits_all, m_hlast, m_dh, img_embeds}) cudaFree(p);
     cudaFree(m_id); cudaFree(m_pos);
@@ -141,7 +142,8 @@ struct Engine::Impl {
   // means a fresh sequence (prefill). Returns the greedy next token.
   int forward_tokens(const std::vector<int>& ids, int T, int start_pos, const std::string* tdir,
                      const int* pos3d_host = nullptr, const float* img_embeds = nullptr,
-                     int img_pos = -1, int img_cnt = 0, std::vector<int>* argmax_all = nullptr) {
+                     int img_pos = -1, int img_cnt = 0, std::vector<int>* argmax_all = nullptr,
+                     bool snapshot = false) {
     bool first = (start_pos == 0);
     std::vector<int> pos3(3 * T);
     if (pos3d_host) std::copy(pos3d_host, pos3d_host + 3 * T, pos3.begin());
@@ -178,12 +180,14 @@ struct Engine::Impl {
         w.bf16(b.xn, gp + ".in_proj_z", b.z, T, L_V, H);
         w.bf16(b.xn, gp + ".in_proj_a", b.ga, T, L_VH, H);
         w.bf16(b.xn, gp + ".in_proj_b", b.gb, T, L_VH, H);
-        causal_conv1d_state_silu(b.qkv, cst[L], (const uint16_t*)w.up_raw(gp + ".conv1d.weight"), b.conv, T, CC, CONV, first);
+        causal_conv1d_state_silu(b.qkv, cst[L], (const uint16_t*)w.up_raw(gp + ".conv1d.weight"), b.conv, T, CC, CONV, first,
+                                 snapshot ? conv_snap[L] : nullptr);
         cudaMemcpy2D(b.q, L_Q * 4, b.conv, CC * 4, L_Q * 4, T, cudaMemcpyDeviceToDevice);
         cudaMemcpy2D(b.k, L_Q * 4, b.conv + L_Q, CC * 4, L_Q * 4, T, cudaMemcpyDeviceToDevice);
         cudaMemcpy2D(b.v, L_V * 4, b.conv + 2 * L_Q, CC * 4, L_V * 4, T, cudaMemcpyDeviceToDevice);
         gdn_gating(w.up_f32(gp + ".A_log"), b.ga, b.gb, w.up_f32(gp + ".dt_bias"), b.g, b.beta, T, L_VH);
-        gdn_recurrence(b.q, b.k, b.v, b.g, b.beta, scale_gdn, b.recur, gst[L], T, L_KH, L_VH, L_KD, L_VD, first);
+        gdn_recurrence(b.q, b.k, b.v, b.g, b.beta, scale_gdn, b.recur, gst[L], T, L_KH, L_VH, L_KD, L_VD, first,
+                       snapshot ? gdn_snap[L] : nullptr);
         rmsnorm_gated(b.recur, w.up_f32(gp + ".norm.weight"), b.z, EPS, b.gated, T * L_VH, L_VD);
         w.nvfp4(b.gated, gp + ".out_proj", b.mix, T, H, L_V);
       }
@@ -219,7 +223,8 @@ struct Engine::Impl {
   float *m_qg=nullptr,*m_q=nullptr,*m_gate=nullptr,*m_k=nullptr,*m_v=nullptr,*m_ao=nullptr,*m_ag=nullptr;
   float *m_mg=nullptr,*m_mu=nullptr,*m_msw=nullptr,*m_kc=nullptr,*m_vc=nullptr;
   float *m_logits_all=nullptr, *m_hlast=nullptr, *m_dh=nullptr;
-  std::vector<float*> gst_bak, cst_bak;                // GDN + conv state snapshots
+  std::vector<float*> gst_bak, cst_bak;                // GDN + conv state snapshots (whole-state)
+  std::vector<float*> gdn_snap, conv_snap;             // per-token state snapshots (MTP rollback, no re-advance)
   int *m_id=nullptr,*m_pos=nullptr;
   static const int MAXV = 10;                          // max verify tokens (k+1)
   static const int MAXV_K = MAXV - 1;                  // max draft tokens
@@ -234,10 +239,21 @@ struct Engine::Impl {
     m_logits_all=dalloc((int64_t)MAXV*VOCAB); m_hlast=dalloc(H); m_dh=dalloc(H);
     cudaMalloc(&m_id,sizeof(int)); cudaMalloc(&m_pos,3*sizeof(int));
     gst_bak.assign(NL,nullptr); cst_bak.assign(NL,nullptr);
+    gdn_snap.assign(NL,nullptr); conv_snap.assign(NL,nullptr);
     for (int L=0;L<NL;++L) {
-      if ((L%FA_INT)!=(FA_INT-1)) { gst_bak[L]=dalloc((int64_t)L_VH*L_VD*L_KD); cst_bak[L]=dalloc((int64_t)CC*(CONV-1)); }
+      if ((L%FA_INT)!=(FA_INT-1)) { gst_bak[L]=dalloc((int64_t)L_VH*L_VD*L_KD); cst_bak[L]=dalloc((int64_t)CC*(CONV-1));
+        gdn_snap[L]=dalloc((int64_t)MAXV*L_VH*L_VD*L_KD); conv_snap[L]=dalloc((int64_t)MAXV*CC*(CONV-1)); }
     }
     mtp_ready = w.st.has("mtp.fc.weight");
+  }
+  // Restore the GDN + conv state to the per-token snapshot after accepted-token
+  // index `idx` (0-based) — the MTP verify's snapshot, so no re-advance forward is needed.
+  void restore_snap(int idx) {
+    int64_t ss = (int64_t)L_VH * L_VD * L_KD, cs = (int64_t)CC * (CONV - 1);
+    for (int L = 0; L < NL; ++L) if (gdn_snap[L]) {
+      cudaMemcpy(gst[L], gdn_snap[L] + idx * ss, ss * 4, cudaMemcpyDeviceToDevice);
+      cudaMemcpy(cst[L], conv_snap[L] + idx * cs, cs * 4, cudaMemcpyDeviceToDevice);
+    }
   }
   void snap_state(bool save) {   // save/restore GDN recurrent + conv state (for rollback)
     for (int L=0;L<NL;++L) if (gst[L]) {
@@ -421,12 +437,11 @@ std::vector<int> Engine::generate_spec(const std::vector<int>& prompt, int max_n
     std::vector<int> drafts;
     { const float* hh = p_->m_hlast; int tok = t, dp = pos;
       for (int j = 0; j < kk; ++j) { int d = p_->mtp_step(hh, tok, dp, p_->m_dh); drafts.push_back(d); hh = p_->m_dh; tok = d; ++dp; } }
-    p_->snap_state(true);
     std::vector<int> vids; vids.push_back(t); for (int d : drafts) vids.push_back(d);
     int VT = (int)vids.size();
     std::vector<int> p3(3 * VT); for (int a = 0; a < 3; ++a) for (int i = 0; i < VT; ++i) p3[a * VT + i] = pos + i;
     std::vector<int> preds;
-    p_->forward_tokens(vids, VT, pos, nullptr, p3.data(), nullptr, -1, 0, &preds);
+    p_->forward_tokens(vids, VT, pos, nullptr, p3.data(), nullptr, -1, 0, &preds, true);  // verify + per-token snapshot
     cudaDeviceSynchronize(); ++fwds;
     out.push_back(t); if (t == eos) { done = true; break; }        // commit t (position pos)
     int n = 0;
@@ -435,14 +450,7 @@ std::vector<int> Engine::generate_spec(const std::vector<int>& prompt, int max_n
     }
     if (done) break;
     int correction = preds[n];                                     // becomes next round's t
-    if (n < (int)drafts.size()) {                                  // partial accept -> roll back + re-advance
-      p_->snap_state(false);
-      std::vector<int> adv; adv.push_back(t); for (int i = 0; i < n; ++i) adv.push_back(drafts[i]);
-      int AT = n + 1; std::vector<int> ap3(3 * AT);
-      for (int a = 0; a < 3; ++a) for (int i = 0; i < AT; ++i) ap3[a * AT + i] = pos + i;
-      p_->forward_tokens(adv, AT, pos, nullptr, ap3.data());
-      cudaDeviceSynchronize(); ++fwds;
-    }
+    if (n < (int)drafts.size()) p_->restore_snap(n);               // roll state to after token n — NO re-advance forward
     cudaMemcpy(p_->m_hlast, p_->b.h + (int64_t)n * H, H * 4, cudaMemcpyDeviceToDevice);  // h_{pos+n}
     t = correction; pos = pos + n + 1;
   }

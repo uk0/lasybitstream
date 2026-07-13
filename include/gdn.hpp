@@ -14,11 +14,14 @@ namespace lb {
 // `state` is a device buffer [num_v_heads * head_v * head_k]. When `reset` is
 // true it is zeroed first (fresh sequence / prefill); when false the recurrence
 // continues from the existing state (incremental decode with a carried cache).
+// `snap` (optional, [T * num_v_heads*head_v*head_k]) receives the recurrent state
+// after each token — used to roll back to an arbitrary accepted length in MTP
+// speculative decoding without re-running the forward.
 void gdn_recurrence(const float* q, const float* k, const float* v,
                     const float* g, const float* beta, float scale,
                     float* out, float* state,
                     int T, int num_k_heads, int num_v_heads, int head_k, int head_v,
-                    bool reset = true);
+                    bool reset = true, float* snap = nullptr);
 
 // GDN gating: g = -exp(A_log) * softplus(a + dt_bias),  beta = sigmoid(b).
 //   A_log, dt_bias : [num_v_heads]     a, b : [T, num_v_heads]

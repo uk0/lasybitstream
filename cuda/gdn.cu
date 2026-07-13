@@ -10,7 +10,8 @@ __global__ void gdn_recurrence_kernel(const float* __restrict__ q, const float* 
                                       const float* __restrict__ v, const float* __restrict__ g,
                                       const float* __restrict__ beta, float scale,
                                       float* __restrict__ out, float* __restrict__ state,
-                                      int T, int HK, int HV, int DK, int DV) {
+                                      int T, int HK, int HV, int DK, int DV,
+                                      float* __restrict__ snap) {
   extern __shared__ float sh[];
   float* ksh = sh;            // [DK]
   float* qsh = sh + DK;       // [DK]
@@ -52,18 +53,20 @@ __global__ void gdn_recurrence_kernel(const float* __restrict__ q, const float* 
     float o = 0.f;
     for (int c = 0; c < DK; ++c) { Srow[c] += vr * ksh[c]; o += Srow[c] * qsh[c]; }
     out[((int64_t)t * HV + hv) * DV + r] = o;
+    if (snap) { float* dst = snap + (((int64_t)t * HV + hv) * DV + r) * DK;   // state after token t
+      for (int c = 0; c < DK; ++c) dst[c] = Srow[c]; }
     __syncthreads();  // ksh/qsh reused next token
   }
 }
 
 void gdn_recurrence(const float* q, const float* k, const float* v, const float* g,
                     const float* beta, float scale, float* out, float* state,
-                    int T, int HK, int HV, int DK, int DV, bool reset) {
+                    int T, int HK, int HV, int DK, int DV, bool reset, float* snap) {
   if (reset) cudaMemset(state, 0, (size_t)HV * DV * DK * sizeof(float));
   int block = DV;  // one thread per state row
   size_t shmem = (2 * DK + block) * sizeof(float);
   gdn_recurrence_kernel<<<HV, block, shmem>>>(q, k, v, g, beta, scale, out, state,
-                                              T, HK, HV, DK, DV);
+                                              T, HK, HV, DK, DV, snap);
 }
 
 __global__ void gdn_gating_kernel(const float* __restrict__ A_log, const float* __restrict__ a,

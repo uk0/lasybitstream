@@ -43,9 +43,10 @@ void attention_cached(const float* q, const float* kc, const float* vc, float* o
 
 // Depthwise causal conv1d (kernel K) + SiLU with a carried state. `state` holds
 // the previous K-1 inputs per channel [C,K-1] (updated in place); when `first`
-// the state is treated as zero (fresh sequence). x [T,C] -> out [T,C].
+// the state is treated as zero (fresh sequence). x [T,C] -> out [T,C]. `snap`
+// (optional, [T*C*(K-1)]) receives the conv window after each token (MTP rollback).
 void causal_conv1d_state_silu(const float* x, float* state, const uint16_t* w_bf16,
-                              float* out, int T, int C, int K, bool first);
+                              float* out, int T, int C, int K, bool first, float* snap = nullptr);
 
 // Per-head split of the fused q/gate projection: in [T,NH,2*HD] (per head [q(HD)|gate(HD)])
 // -> q [T,NH,HD], gate [T,NH,HD].

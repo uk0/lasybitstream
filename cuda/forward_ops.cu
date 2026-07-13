@@ -333,7 +333,7 @@ void attention_cached(const float* q, const float* kc, const float* vc, float* o
 // one thread per channel, sequential over the T new tokens, sliding a K-1 window.
 __global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restrict__ state,
                                     const uint16_t* __restrict__ w, float* __restrict__ out,
-                                    int T, int C, int K, int first) {
+                                    int T, int C, int K, int first, float* __restrict__ snap) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
   float hist[8];                                  // K-1 previous inputs, oldest..newest
@@ -345,13 +345,14 @@ __global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restri
     out[(int64_t)t * C + c] = siluf(acc);
     for (int m = 0; m < K - 2; ++m) hist[m] = hist[m + 1];
     hist[K - 2] = cur;
+    if (snap) { float* d = snap + ((int64_t)t * C + c) * (K - 1); for (int m = 0; m < K - 1; ++m) d[m] = hist[m]; }
   }
   for (int m = 0; m < K - 1; ++m) state[(int64_t)c * (K - 1) + m] = hist[m];
 }
 void causal_conv1d_state_silu(const float* x, float* state, const uint16_t* w, float* out,
-                              int T, int C, int K, bool first) {
+                              int T, int C, int K, bool first, float* snap) {
   int block = 256, grid = (C + block - 1) / block;
-  conv1d_state_kernel<<<grid, block>>>(x, state, w, out, T, C, K, first ? 1 : 0);
+  conv1d_state_kernel<<<grid, block>>>(x, state, w, out, T, C, K, first ? 1 : 0, snap);
 }
 
 // ---- per-head q/gate split ----
