@@ -74,10 +74,15 @@ add_executable(lbinfer
   cuda/forward_ops.cu)
 target_link_libraries(lbinfer PRIVATE CUDA::cudart)
 
+# Byte-level BPE tokenizer + chat template (CPU only).
+add_executable(lbtest_tok
+  test/test_tokenizer.cc
+  src/tokenizer.cc)
+
 set_target_properties(lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer)
+foreach(t lbload lbtest_nvfp4 lbtest_gemm lbtest_ops lbtest_mlp lbtest_gdn lbinfer lbtest_tok)
   target_compile_options(${t} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
     $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
