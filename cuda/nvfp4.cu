@@ -1,6 +1,8 @@
 #include "nvfp4.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <algorithm>
 
 namespace lb {
@@ -11,6 +13,14 @@ __constant__ float kE2M1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
 __device__ __forceinline__ float fp4_to_float(unsigned nib) {
   float m = kE2M1[nib & 7u];
   return (nib & 8u) ? -m : m;
+}
+
+// Hardware FP4 (e2m1) x2 -> f32 x2 decode (Blackwell `cvt.rn.f16x2.e2m1x2`): the
+// low nibble decodes to .x, the high nibble to .y — matching the pack convention
+// (low nibble = even column). Removes the scalar LUT ALU from the GEMV hot loop.
+__device__ __forceinline__ float2 e2m1x2_to_f2(uint8_t byte) {
+  __nv_fp4x2_e2m1 v; v.__x = byte;
+  return __half22float2(static_cast<__half2>(v));
 }
 
 __device__ __forceinline__ float fp8e4m3_to_float(uint8_t raw) {
@@ -103,10 +113,10 @@ __global__ void gemv_nvfp4_m1_kernel(const float* __restrict__ x, const uint8_t*
       float s1 = fp8e4m3_to_float((uint8_t)(raw2 >> 8)) / gscale;
       #pragma unroll
       for (int b = 0; b < 16; ++b) {
-        uint8_t byte = get_byte(p, b);
+        float2 w2 = e2m1x2_to_f2(get_byte(p, b));
         float s = (b < 8) ? s0 : s1;
-        acc = fmaf(xs[lane][2 * b], fp4_to_float(byte & 0xF) * s, acc);
-        acc = fmaf(xs[lane][2 * b + 1], fp4_to_float(byte >> 4) * s, acc);
+        acc = fmaf(xs[lane][2 * b], w2.x * s, acc);
+        acc = fmaf(xs[lane][2 * b + 1], w2.y * s, acc);
       }
     }
     __syncthreads();
@@ -138,8 +148,8 @@ __global__ void gemm_nvfp4_smallM_kernel(const float* __restrict__ x, const uint
     float wv[32];
     #pragma unroll
     for (int b = 0; b < 16; ++b) {
-      uint8_t byte = get_byte(p, b); float s = (b < 8) ? s0 : s1;
-      wv[2 * b] = fp4_to_float(byte & 0xF) * s; wv[2 * b + 1] = fp4_to_float(byte >> 4) * s;
+      float2 w2 = e2m1x2_to_f2(get_byte(p, b)); float s = (b < 8) ? s0 : s1;
+      wv[2 * b] = w2.x * s; wv[2 * b + 1] = w2.y * s;
     }
     for (int m = 0; m < M; ++m) {
       const float* xr = x + (int64_t)m * IN + col;

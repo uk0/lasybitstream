@@ -14,7 +14,7 @@ if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
   set(CMAKE_CUDA_HOST_COMPILER clang++)
 endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 121)
+  set(CMAKE_CUDA_ARCHITECTURES 121a)   # 'a' = arch-specific (enables Blackwell FP4 cvt on GB10)
 endif()
 
 project(lasybitstream LANGUAGES CXX CUDA)
