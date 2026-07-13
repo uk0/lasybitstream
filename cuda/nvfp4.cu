@@ -225,39 +225,65 @@ __global__ void gemm_nvfp4_stage_kernel(const float* __restrict__ x, const uint8
 // compute ceiling ~20x over f32 FMA, so batching becomes weight-bandwidth-bound
 // again (M=64 -> ~800 tok/s). W4A16 with bf16 activations.
 namespace wmma = nvcuda::wmma;
+// 8 warps/block compute a 16(M) x 128(N) tile: the A tile [16 M x 64 K] is staged
+// once and shared, each warp owns a 16-wide N sub-tile and streams its own weight
+// (coalesced uint4 loads + hardware e2m1 decode). K-tile = 64 -> four 16x16x16 mma
+// steps. Many warps/block keeps the SMs busy so batching becomes bandwidth-bound.
+static const int NWARP = 8, BM = 64, MFRAG = BM / 16;   // block processes BM batch rows
 __global__ void gemm_nvfp4_wmma_kernel(const float* __restrict__ x, const uint8_t* __restrict__ packed,
                                        const uint8_t* __restrict__ scale, float gscale,
                                        float* __restrict__ y, int M, int OUT, int IN, int in2, int gg) {
-  int nt = blockIdx.x * 16, mt = blockIdx.y * 16;      // output-neuron / batch-row tile origins
-  __shared__ __nv_bfloat16 As[16 * 16], Bs[16 * 16];
-  __shared__ float Cs[16 * 16];
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
-  wmma::fill_fragment(cf, 0.f);
-  for (int k0 = 0; k0 < IN; k0 += 16) {
-    for (int idx = threadIdx.x; idx < 256; idx += 32) {
-      int m = idx >> 4, kk = idx & 15;                 // A[m][k] row-major (bf16)
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int mt = blockIdx.y * BM, nt = (blockIdx.x * NWARP + warp) * 16;
+  __shared__ __nv_bfloat16 As[BM * 64];               // A tile [BM rows][64 K], shared by all warps
+  __shared__ __nv_bfloat16 Bs[NWARP][64 * 16];        // per-warp B tile (loaded ONCE per K-tile)
+  __shared__ float Cs[NWARP][16 * 16];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf[MFRAG];
+  #pragma unroll
+  for (int j = 0; j < MFRAG; ++j) wmma::fill_fragment(cf[j], 0.f);
+  for (int k0 = 0; k0 < IN; k0 += 64) {
+    for (int idx = threadIdx.x; idx < BM * 64; idx += NWARP * 32) {   // stage all BM activation rows
+      int m = idx >> 6, kk = idx & 63;
       As[idx] = (mt + m < M) ? __float2bfloat16(x[(int64_t)(mt + m) * IN + k0 + kk]) : (__nv_bfloat16)0;
-      int n = idx >> 4, kb = idx & 15;                 // B[k][n] col-major: Bs[kb + n*16] = W[nt+n, k0+kb]
-      int o = nt + n; float w = 0.f;
-      if (o < OUT) {
-        uint8_t byte = packed[(int64_t)o * in2 + ((k0 + kb) >> 1)];
-        unsigned nib = ((k0 + kb) & 1) ? (byte >> 4) : (byte & 0xF);
-        w = fp4_to_float(nib) * fp8e4m3_to_float(scale[(int64_t)o * gg + (k0 + kb) / 16]) / gscale;
+    }
+    { int n = lane >> 1, half = lane & 1, o = nt + n;            // warp stages its B tile ONCE
+      if (o >= OUT) { for (int b = 0; b < 32; ++b) Bs[warp][(half * 32 + b) + n * 64] = (__nv_bfloat16)0; }
+      else {
+        int col = k0 + half * 32;
+        uint4 p = *reinterpret_cast<const uint4*>(packed + (int64_t)o * in2 + (col >> 1));
+        uint16_t raw2 = *reinterpret_cast<const uint16_t*>(scale + (int64_t)o * gg + (col >> 4));
+        float s0 = fp8e4m3_to_float((uint8_t)(raw2 & 0xff)) / gscale;
+        float s1 = fp8e4m3_to_float((uint8_t)(raw2 >> 8)) / gscale;
+        #pragma unroll
+        for (int b = 0; b < 16; ++b) {
+          float2 w2 = e2m1x2_to_f2(get_byte(p, b)); float s = (b < 8) ? s0 : s1;
+          Bs[warp][(half * 32 + 2 * b) + n * 64] = __float2bfloat16(w2.x * s);
+          Bs[warp][(half * 32 + 2 * b + 1) + n * 64] = __float2bfloat16(w2.y * s);
+        }
       }
-      Bs[kb + n * 16] = __float2bfloat16(w);
     }
     __syncthreads();
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
-    wmma::load_matrix_sync(af, As, 16);
-    wmma::load_matrix_sync(bf, Bs, 16);
-    wmma::mma_sync(cf, af, bf, cf);
+    #pragma unroll
+    for (int ks = 0; ks < 64; ks += 16) {
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+      wmma::load_matrix_sync(bf, Bs[warp] + ks, 64);            // weight fragment: loaded once, reused across M
+      #pragma unroll
+      for (int j = 0; j < MFRAG; ++j) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+        wmma::load_matrix_sync(af, As + j * 16 * 64 + ks, 64);
+        wmma::mma_sync(cf[j], af, bf, cf[j]);
+      }
+    }
     __syncthreads();
   }
-  wmma::store_matrix_sync(Cs, cf, 16, wmma::mem_row_major);
-  for (int idx = threadIdx.x; idx < 256; idx += 32) {
-    int m = idx >> 4, n = idx & 15;
-    if (mt + m < M && nt + n < OUT) y[(int64_t)(mt + m) * OUT + nt + n] = Cs[idx];
+  #pragma unroll
+  for (int j = 0; j < MFRAG; ++j) {
+    wmma::store_matrix_sync(Cs[warp], cf[j], 16, wmma::mem_row_major);
+    for (int idx = lane; idx < 256; idx += 32) {
+      int m = idx >> 4, n = idx & 15, row = mt + j * 16 + m;
+      if (row < M && nt + n < OUT) y[(int64_t)row * OUT + nt + n] = Cs[warp][idx];
+    }
+    __syncwarp();
   }
 }
 
@@ -265,14 +291,10 @@ void gemm_nvfp4(const float* x, const uint8_t* packed, const uint8_t* scale, flo
                 float* y, int M, int64_t out, int64_t in, int group) {
   int in2 = (int)(in / 2);
   int gg = (int)(in / group);
-  // Tensor-core WMMA path (WIP): correct at bf16 precision but currently slower
-  // than the staged f32 kernel because the B-staging does naive scalar FP4 dequant
-  // with per-byte global reads. Needs vectorized (uint4) weight loads + hardware
-  // e2m1x2 decode + wider K-tiling to feed the tensor cores at bandwidth. Gated off
-  // until then (set LB_WMMA=1 to try). This is the pinned next step toward 500+.
-  if (M >= 16 && group == 16 && (in % 16) == 0 && getenv("LB_WMMA")) {
-    dim3 grid((unsigned)((out + 15) / 16), (unsigned)((M + 15) / 16));
-    gemm_nvfp4_wmma_kernel<<<grid, 32>>>(x, packed, scale, gscale, y, M, (int)out, (int)in, in2, gg);
+  // Tensor-core (bf16 WMMA) batched path for M>=16 (W4A16, bf16 activations).
+  if (M >= 16 && group == 16 && (in % 64) == 0 && !getenv("LB_NOWMMA")) {
+    dim3 grid((unsigned)((out + NWARP * 16 - 1) / (NWARP * 16)), (unsigned)((M + BM - 1) / BM));
+    gemm_nvfp4_wmma_kernel<<<grid, NWARP * 32>>>(x, packed, scale, gscale, y, M, (int)out, (int)in, in2, gg);
     return;
   }
   if (M == 1 && group == 16 && (in % 1024) == 0) {   // fast decode GEMV path

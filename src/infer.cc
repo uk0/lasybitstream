@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
   if (bench) {                                          // aggregate-batching throughput curve
     Engine eng; eng.load(mdir, 64);
     printf("=== aggregate throughput (weights read once per forward) ===\n");
-    for (int M : {1, 2, 4, 8, 16, 32}) printf("  batch M=%2d : %.1f tok/s\n", M, eng.bench(M, 3));
+    for (int M : {1, 2, 4, 8, 16, 32, 64, 128, 256}) printf("  batch M=%3d : %.1f tok/s\n", M, eng.bench(M, 3));
     return 0;
   }
 
