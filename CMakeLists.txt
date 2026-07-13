@@ -27,16 +27,26 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+find_package(CUDAToolkit REQUIRED)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# Loader + device round-trip (the checkpoint-load milestone).
 add_executable(lbload
   src/main.cc
   src/loader.cc
   cuda/device.cu)
 
-set_target_properties(lbload PROPERTIES
+# NVFP4 dequant kernel correctness test (matches the compressed_tensors reference).
+add_executable(lbtest_nvfp4
+  test/test_nvfp4.cc
+  cuda/nvfp4.cu)
+target_link_libraries(lbtest_nvfp4 PRIVATE CUDA::cudart)
+
+set_target_properties(lbload lbtest_nvfp4 PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
-target_compile_options(lbload PRIVATE
-  $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
-  $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
+foreach(t lbload lbtest_nvfp4)
+  target_compile_options(${t} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O2 -lineinfo>)
+endforeach()

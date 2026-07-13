@@ -3,3 +3,9 @@ build/
 *.obj
 compile_commands.json
 .cache/
+# generated test fixtures (regenerate with scripts/nvfp4_ref.py)
+test/*.f32
+test/*.npy
+# python venv (dev-only helpers, not part of the clang+cuda engine)
+.venv/
+__pycache__/
