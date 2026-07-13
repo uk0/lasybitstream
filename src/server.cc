@@ -6,6 +6,7 @@
 //   ./lbserve <model_dir> [port] [max_tokens]
 #include "engine.hpp"
 #include "tokenizer.hpp"
+#include "preprocess.hpp"
 #include "json.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -38,18 +39,40 @@ static std::string json_escape(const std::string& s) {
   return o;
 }
 
-// Extract the text of a chat message: content may be a string or an array of
-// parts — OpenAI {type:"text"|"image_url"} or Anthropic {type:"text"|"image"}.
-static std::string content_text(const Json& content, bool& had_image) {
+// Extract the text of a chat message; if a part carries an image, its source
+// (a data: URL, an http(s) URL, or raw base64) is returned in `image_src`.
+// Handles OpenAI {type:"image_url",image_url:{url}} and Anthropic
+// {type:"image",source:{type:"base64",data} | {type:"url",url}}.
+static std::string content_text(const Json& content, std::string& image_src) {
   if (content.is_str()) return content.s();
   std::string out;
   if (content.is_arr())
     for (auto& part : content.arr) {
       std::string ty = part.at("type").s();
       if (ty == "text") out += part.at("text").s();
-      else if (ty == "image_url" || ty == "image") had_image = true;  // vision tower not yet wired
+      else if (ty == "image_url") image_src = part.at("image_url").at("url").s();
+      else if (ty == "image") {
+        const Json& src = part.at("source");
+        image_src = src.has("data") ? src.at("data").s() : src.at("url").s();
+      }
     }
   return out;
+}
+
+// Fetch decoded image bytes from a source (data: URL base64, http(s) URL via curl,
+// or raw base64).
+static std::vector<uint8_t> fetch_image(const std::string& src) {
+  if (src.rfind("http", 0) == 0) {                     // download via curl
+    std::string cmd = "curl -sL --max-time 20 '" + src + "'";
+    FILE* p = popen(cmd.c_str(), "r");
+    std::vector<uint8_t> b; if (!p) return b;
+    uint8_t buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) b.insert(b.end(), buf, buf + n);
+    pclose(p); return b;
+  }
+  size_t comma = src.find("base64,");                  // data: URL -> strip prefix
+  std::string b64 = comma != std::string::npos ? src.substr(comma + 7) : src;
+  return base64_decode(b64);
 }
 
 // Largest prefix length of s that ends on a complete UTF-8 character, so a
@@ -63,6 +86,32 @@ static size_t utf8_safe_end(const std::string& s) {
   unsigned char lead = s[p];
   int need = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : 4;
   return (p + (size_t)need <= s.size()) ? s.size() : p;
+}
+
+static const int IMAGE_TOKEN_ID = 248056;              // <|image_pad|>
+
+// Build ChatMsgs from the request; if a message carries an image, fetch+preprocess+
+// encode it and splice <|vision_start|>…<|image_pad|>×N…<|vision_end|> into that
+// message. Returns the merged image-token count (0 = text only); sets gh/gw.
+static int build_msgs(const Json& messages, std::vector<ChatMsg>& msgs, int& gh, int& gw) {
+  int merged = 0;
+  for (auto& m : messages.arr) {
+    std::string img_src, text = content_text(m.at("content"), img_src), content = text;
+    if (!img_src.empty() && merged == 0) {             // one image per request supported
+      std::vector<uint8_t> bytes = fetch_image(img_src);
+      if (!bytes.empty()) {
+        PreImage pre = preprocess_image(bytes.data(), bytes.size());
+        if (pre.ok) {
+          merged = g_eng->encode_image(pre.pixels, pre.t, pre.h, pre.w);
+          gh = pre.h; gw = pre.w;
+          std::string pads; for (int i = 0; i < merged; ++i) pads += "<|image_pad|>";
+          content = "<|vision_start|>" + pads + "<|vision_end|>" + text;
+        }
+      }
+    }
+    msgs.push_back({m.at("role").s(), content});
+  }
+  return merged;
 }
 
 static void send_all(int fd, const std::string& s) {
@@ -80,12 +129,10 @@ static std::string http_json(const std::string& body, int code = 200) {
 static long now_s() { return (long)time(nullptr); }
 
 static void handle_chat(int fd, const Json& req) {
-  // build the ChatML prompt from messages
-  std::vector<ChatMsg> msgs;
-  bool had_image = false, enable_thinking = true;
-  if (req.has("enable_thinking")) enable_thinking = req.at("enable_thinking").boolean(true);
-  for (auto& m : req.at("messages").arr)
-    msgs.push_back({m.at("role").s(), content_text(m.at("content"), had_image)});
+  // build the ChatML prompt from messages (encoding an image if present)
+  std::vector<ChatMsg> msgs; int gh = 0, gw = 0;
+  bool enable_thinking = req.has("enable_thinking") ? req.at("enable_thinking").boolean(true) : true;
+  int merged = build_msgs(req.at("messages"), msgs, gh, gw);
   int max_new = req.has("max_tokens") ? (int)req.at("max_tokens").i64(g_max_tokens) : g_max_tokens;
   if (max_new <= 0 || max_new > 2048) max_new = g_max_tokens;
   bool stream = req.has("stream") && req.at("stream").boolean(false);
@@ -97,7 +144,8 @@ static void handle_chat(int fd, const Json& req) {
   char idbuf[64]; snprintf(idbuf, 64, "chatcmpl-%ld", now_s());
 
   if (!stream) {
-    std::vector<int> out = g_eng->generate(ids, max_new, eos);
+    std::vector<int> out = merged > 0 ? g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos)
+                                      : g_eng->generate(ids, max_new, eos);
     std::string text = g_tok->decode(out, true);
     std::string body = std::string("{\"id\":\"") + idbuf + "\",\"object\":\"chat.completion\",\"created\":" +
       std::to_string(now_s()) + ",\"model\":\"" + g_model + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" +
@@ -122,12 +170,14 @@ static void handle_chat(int fd, const Json& req) {
   sse("", nullptr);  // role chunk (delta {} keeps it simple)
   std::vector<int> acc;
   std::string sent;
-  g_eng->generate(ids, max_new, eos, [&](int tid) {
+  auto cb = [&](int tid) {
     acc.push_back(tid);
     std::string full = g_tok->decode(acc, true);
     size_t end = utf8_safe_end(full);
     if (end > sent.size()) { sse(full.substr(sent.size(), end - sent.size()), nullptr); sent = full.substr(0, end); }
-  });
+  };
+  if (merged > 0) g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos, cb);
+  else g_eng->generate(ids, max_new, eos, cb);
   std::string full = g_tok->decode(acc, true);
   if (full.size() > sent.size()) sse(full.substr(sent.size()), nullptr);
   sse("", (int)acc.size() >= max_new ? "length" : "stop");
@@ -137,8 +187,7 @@ static void handle_chat(int fd, const Json& req) {
 // Anthropic Messages API: POST /v1/messages. Differs from OpenAI — `system` is a
 // top-level field (string or text blocks), and the SSE stream is an event sequence.
 static void handle_messages(int fd, const Json& req) {
-  std::vector<ChatMsg> msgs;
-  bool had_image = false;
+  std::vector<ChatMsg> msgs; int gh = 0, gw = 0;
   if (req.has("system")) {
     const Json& s = req.at("system");
     std::string systext;
@@ -146,8 +195,7 @@ static void handle_messages(int fd, const Json& req) {
     else if (s.is_arr()) for (auto& blk : s.arr) if (blk.at("type").s() == "text") systext += blk.at("text").s();
     if (!systext.empty()) msgs.push_back({"system", systext});
   }
-  for (auto& m : req.at("messages").arr)
-    msgs.push_back({m.at("role").s(), content_text(m.at("content"), had_image)});
+  int merged = build_msgs(req.at("messages"), msgs, gh, gw);
   int max_new = req.has("max_tokens") ? (int)req.at("max_tokens").i64(g_max_tokens) : g_max_tokens;
   if (max_new <= 0 || max_new > 2048) max_new = g_max_tokens;
   bool stream = req.has("stream") && req.at("stream").boolean(false);
@@ -160,7 +208,8 @@ static void handle_messages(int fd, const Json& req) {
   char idbuf[64]; snprintf(idbuf, 64, "msg_%ld", now_s());
 
   if (!stream) {
-    std::vector<int> out = g_eng->generate(ids, max_new, eos);
+    std::vector<int> out = merged > 0 ? g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos)
+                                      : g_eng->generate(ids, max_new, eos);
     std::string text = g_tok->decode(out, true);
     const char* stop_reason = (int)out.size() >= max_new ? "max_tokens" : "end_turn";
     std::string body = std::string("{\"id\":\"") + idbuf + "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" +
@@ -189,12 +238,14 @@ static void handle_messages(int fd, const Json& req) {
     ev("content_block_delta", "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" +
        json_escape(delta) + "\"}}");
   };
-  g_eng->generate(ids, max_new, eos, [&](int tid) {
+  auto cb = [&](int tid) {
     acc.push_back(tid);
     std::string full = g_tok->decode(acc, true);
     size_t end = utf8_safe_end(full);
     if (end > sent.size()) { emit(full.substr(sent.size(), end - sent.size())); sent = full.substr(0, end); }
-  });
+  };
+  if (merged > 0) g_eng->generate_mm(ids, IMAGE_TOKEN_ID, gh, gw, max_new, eos, cb);
+  else g_eng->generate(ids, max_new, eos, cb);
   std::string full = g_tok->decode(acc, true);
   if (full.size() > sent.size()) emit(full.substr(sent.size()));
   ev("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}");

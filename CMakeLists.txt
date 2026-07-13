@@ -78,8 +78,8 @@ add_executable(lbtest_tok
   test/test_tokenizer.cc
   src/tokenizer.cc)
 
-# OpenAI-compatible HTTP server: tokenizer + chat template + native engine.
-add_executable(lbserve src/server.cc src/tokenizer.cc ${ENGINE_SRC})
+# OpenAI + Anthropic HTTP server: tokenizer + chat template + native engine + vision.
+add_executable(lbserve src/server.cc src/tokenizer.cc src/preprocess.cc ${ENGINE_SRC})
 target_link_libraries(lbserve PRIVATE CUDA::cudart)
 
 # Vision tower (model.visual.* ViT): verify merged image embeddings vs the golden dump.
