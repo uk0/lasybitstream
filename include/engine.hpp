@@ -40,6 +40,11 @@ class Engine {
   // (weights read once), i.e. the per-step throughput of a batch of M concurrent decodes.
   double bench(int M, int iters = 3);
 
+  // Real aggregate decode throughput: B sequences decoded together for `steps`
+  // steps from a warm context of `ctx` tokens, with per-sequence KV/GDN/conv state
+  // (not GEMM-only). Returns tokens/s summed across all B sequences.
+  double bench_decode(int B, int ctx, int steps);
+
   // --- vision / multimodal ---
   // Encode one image's preprocessed patches `pixels` [t*h*w, 1536] into image
   // embeddings held by the engine. Returns the merged image-token count.
