@@ -28,6 +28,7 @@ static const int L_Q = L_KH * L_KD, L_V = L_VH * L_VD;   // 2048, 6144
 static const int INTER = 17408;
 
 static float* dalloc(int64_t n) { float* p; cudaMalloc(&p, n * sizeof(float)); return p; }
+static uint8_t* dalloc_u8(int64_t n) { uint8_t* p; cudaMalloc(&p, n); return p; }
 
 struct Weights {
   SafeTensors st;
@@ -109,7 +110,8 @@ struct Engine::Impl {
   Buf b;
   int max_ctx = 4096;
   static const int CC = L_Q * 2 + L_V;                 // 10240 GDN conv channels
-  std::vector<float*> kc, vc, gst, cst;                // per-layer caches (NL entries)
+  std::vector<uint8_t*> kc, vc;                        // per-layer fp8 K/V cache (attn layers)
+  std::vector<float*> ksc, vsc, gst, cst;              // per-(token,head) KV scales + GDN state
   VisionTower vt;                                      // model.visual.* module
   float* img_embeds = nullptr;                         // [merged, H] for the current image
   int img_merged = 0;
@@ -118,7 +120,8 @@ struct Engine::Impl {
   ~Impl() {
     if (kc.empty()) return;                            // never loaded
     b.free();
-    for (int L = 0; L < NL; ++L) { cudaFree(kc[L]); cudaFree(vc[L]); cudaFree(gst[L]); cudaFree(cst[L]);
+    for (int L = 0; L < NL; ++L) { cudaFree(kc[L]); cudaFree(vc[L]); cudaFree(ksc[L]); cudaFree(vsc[L]);
+      cudaFree(gst[L]); cudaFree(cst[L]);
       if (L < (int)gst_bak.size()) { cudaFree(gst_bak[L]); cudaFree(cst_bak[L]); }
       if (L < (int)gdn_snap.size()) { cudaFree(gdn_snap[L]); cudaFree(conv_snap[L]); } }
     for (float* p : {m_emb, m_hn, m_en, m_cat, m_x, m_xn, m_tmp, m_qg, m_q, m_gate, m_k, m_v, m_ao,
@@ -127,10 +130,12 @@ struct Engine::Impl {
   }
 
   void alloc_caches() {
-    kc.assign(NL, nullptr); vc.assign(NL, nullptr); gst.assign(NL, nullptr); cst.assign(NL, nullptr);
+    kc.assign(NL, nullptr); vc.assign(NL, nullptr); ksc.assign(NL, nullptr); vsc.assign(NL, nullptr);
+    gst.assign(NL, nullptr); cst.assign(NL, nullptr);
     for (int L = 0; L < NL; ++L) {
       if ((L % FA_INT) == (FA_INT - 1)) {
-        kc[L] = dalloc((int64_t)max_ctx * NKV * HD); vc[L] = dalloc((int64_t)max_ctx * NKV * HD);
+        kc[L] = dalloc_u8((int64_t)max_ctx * NKV * HD); vc[L] = dalloc_u8((int64_t)max_ctx * NKV * HD);
+        ksc[L] = dalloc((int64_t)max_ctx * NKV); vsc[L] = dalloc((int64_t)max_ctx * NKV);
       } else {
         gst[L] = dalloc((int64_t)L_VH * L_VD * L_KD); cst[L] = dalloc((int64_t)CC * (CONV - 1));
       }
@@ -169,9 +174,8 @@ struct Engine::Impl {
         rmsnorm(b.ak, w.up_f32(ap + ".k_norm.weight"), EPS, b.ak, T * NKV, HD);
         rope_mrope(b.aq, b.ak, b.pos3d_d, T, NH, NKV, HD, ROT, THETA);
         // append new k,v to the cache, then attend over [0, start_pos+T)
-        cudaMemcpy(kc[L] + (int64_t)start_pos * KV_SIZE, b.ak, (int64_t)T * KV_SIZE * 4, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(vc[L] + (int64_t)start_pos * KV_SIZE, b.av, (int64_t)T * KV_SIZE * 4, cudaMemcpyDeviceToDevice);
-        attention_cached(b.aq, kc[L], vc[L], b.aout, T, NH, NKV, HD, start_pos);
+        store_kv_fp8(b.ak, b.av, kc[L], vc[L], ksc[L], vsc[L], T, NKV, HD, start_pos);
+        attention_cached_fp8(b.aq, kc[L], vc[L], ksc[L], vsc[L], b.aout, T, NH, NKV, HD, start_pos);
         mul_sigmoid_gate(b.aout, b.agate, b.agated, T * Q_SIZE);
         w.nvfp4(b.agated, ap + ".o_proj", b.mix, T, H, Q_SIZE);
       } else {

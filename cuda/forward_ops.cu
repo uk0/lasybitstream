@@ -1,6 +1,7 @@
 #include "forward.hpp"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
 #include <cstdlib>
 #include <cfloat>
@@ -327,6 +328,73 @@ void attention_cached(const float* q, const float* kc, const float* vc, float* o
                       int T, int NH, int NKV, int HD, int start_pos) {
   dim3 block(HD), grid(NH, T);
   attention_cached_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, out, T, NH, NKV, HD, start_pos);
+}
+
+// ---- FP8 (e4m3) KV cache: 4x smaller than f32, per-(token,kv-head) absmax scale ----
+static __device__ __forceinline__ float fp8_to_f(uint8_t x) { __nv_fp8_e4m3 t; t.__x = x; return float(t); }
+static __device__ __forceinline__ uint8_t f_to_fp8(float v) { return __nv_fp8_e4m3(v).__x; }
+
+// Quantize new K/V [T,NKV,HD] f32 -> the fp8 cache at start_pos; scale = absmax/448 per (token,head).
+__global__ void store_kv_fp8_kernel(const float* __restrict__ k, const float* __restrict__ v,
+                                    uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
+                                    float* __restrict__ ksc, float* __restrict__ vsc,
+                                    int T, int NKV, int HD, int start_pos) {
+  int t = blockIdx.x, hh = blockIdx.y, lane = threadIdx.x;   // token, kv-head, dim
+  extern __shared__ float red[];
+  int64_t base = ((int64_t)t * NKV + hh) * HD;
+  float kk = k[base + lane], vv = v[base + lane];
+  red[lane] = fabsf(kk); __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] = fmaxf(red[lane], red[lane + s]); __syncthreads(); }
+  float kmax = red[0]; __syncthreads();
+  red[lane] = fabsf(vv); __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] = fmaxf(red[lane], red[lane + s]); __syncthreads(); }
+  float vmax = red[0];
+  float ks = kmax > 0.f ? kmax / 448.f : 1.f, vs = vmax > 0.f ? vmax / 448.f : 1.f;
+  int64_t cpos = (int64_t)(start_pos + t) * NKV + hh;
+  kc[cpos * HD + lane] = f_to_fp8(kk / ks);
+  vc[cpos * HD + lane] = f_to_fp8(vv / vs);
+  if (lane == 0) { ksc[cpos] = ks; vsc[cpos] = vs; }
+}
+void store_kv_fp8(const float* k, const float* v, uint8_t* kc, uint8_t* vc,
+                  float* ksc, float* vsc, int T, int NKV, int HD, int start_pos) {
+  dim3 grid(T, NKV), block(HD);
+  store_kv_fp8_kernel<<<grid, block, HD * sizeof(float)>>>(k, v, kc, vc, ksc, vsc, T, NKV, HD, start_pos);
+}
+
+// Cached GQA attention over an fp8 K/V cache (dequant on read). Mirrors attention_cached.
+__global__ void attention_cached_fp8_kernel(const float* __restrict__ q,
+                                            const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+                                            const float* __restrict__ ksc, const float* __restrict__ vsc,
+                                            float* __restrict__ out, int T, int NH, int NKV, int HD, int start_pos) {
+  int h = blockIdx.x, i = blockIdx.y;
+  if (h >= NH || i >= T) return;
+  int kvh = h / (NH / NKV), lane = threadIdx.x;
+  extern __shared__ float sh[];
+  float* qsh = sh; float* red = sh + HD;
+  qsh[lane] = q[(((int64_t)i * NH + h) * HD) + lane];
+  __syncthreads();
+  float scale = rsqrtf((float)HD);
+  int limit = start_pos + i;
+  float m = -FLT_MAX, l = 0.f, acc = 0.f;
+  for (int tk = 0; tk <= limit; ++tk) {
+    int64_t cpos = (int64_t)tk * NKV + kvh;
+    red[lane] = qsh[lane] * (fp8_to_f(kc[cpos * HD + lane]) * ksc[cpos]);
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] += red[lane + s]; __syncthreads(); }
+    float score = red[0] * scale;
+    __syncthreads();
+    float mn = fmaxf(m, score), corr = __expf(m - mn), p = __expf(score - mn);
+    l = l * corr + p;
+    acc = acc * corr + p * (fp8_to_f(vc[cpos * HD + lane]) * vsc[cpos]);
+    m = mn;
+  }
+  out[(((int64_t)i * NH + h) * HD) + lane] = acc / l;
+}
+void attention_cached_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
+                          const float* ksc, const float* vsc, float* out,
+                          int T, int NH, int NKV, int HD, int start_pos) {
+  dim3 block(HD), grid(NH, T);
+  attention_cached_fp8_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, ksc, vsc, out, T, NH, NKV, HD, start_pos);
 }
 
 // ---- depthwise causal conv1d + SiLU with carried state ----
