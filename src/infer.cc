@@ -13,18 +13,26 @@ using namespace lb;
 int main(int argc, char** argv) {
   std::string mdir = argc > 1 ? argv[1] : "/model";
   std::string tdir = argc > 2 ? argv[2] : "test";
-  int gen = 0, spec = 0; bool mm = false, bench = false;
+  int gen = 0, spec = 0; bool mm = false, bench = false, decbench = false;
   for (int i = 3; i < argc; ++i) {
     if (std::string(argv[i]) == "gen" && i + 1 < argc) gen = atoi(argv[i + 1]);
     if (std::string(argv[i]) == "spec" && i + 1 < argc) spec = atoi(argv[i + 1]);  // k drafts
     if (std::string(argv[i]) == "mm") mm = true;
     if (std::string(argv[i]) == "bench") bench = true;
+    if (std::string(argv[i]) == "decbench") decbench = true;
   }
 
-  if (bench) {                                          // aggregate-batching throughput curve
+  if (bench) {                                          // aggregate-batching throughput curve (GEMM-only)
     Engine eng; eng.load(mdir, 64);
     printf("=== aggregate throughput (weights read once per forward) ===\n");
-    for (int M : {1, 2, 4, 8, 16, 32, 64, 128, 256}) printf("  batch M=%3d : %.1f tok/s\n", M, eng.bench(M, 3));
+    for (int M : {1, 32, 64, 128, 256, 512, 1024}) printf("  batch M=%4d : %.1f tok/s\n", M, eng.bench(M, 3));
+    return 0;
+  }
+
+  if (decbench) {                                       // real aggregate decode (per-seq KV/GDN/conv state)
+    Engine eng; eng.load(mdir, 640);
+    printf("=== batched decode throughput (real per-seq state, ctx=256, 32 steps) ===\n");
+    for (int B : {1, 8, 16, 32, 48, 64}) printf("  B=%3d : %.1f tok/s\n", B, eng.bench_decode(B, 256, 32));
     return 0;
   }
 

@@ -397,6 +397,84 @@ void attention_cached_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
   attention_cached_fp8_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, ksc, vsc, out, T, NH, NKV, HD, start_pos);
 }
 
+// ============ Batched decode: B independent sequences, ONE token each, lockstep at `pos` ============
+// Store B new K/V (1 token/seq) into per-seq fp8 caches [B, max_ctx, NKV, HD] at position `pos`.
+__global__ void store_kv_fp8_batched_kernel(const float* __restrict__ k, const float* __restrict__ v,
+    uint8_t* __restrict__ kc, uint8_t* __restrict__ vc, float* __restrict__ ksc, float* __restrict__ vsc,
+    int B, int NKV, int HD, int pos, int max_ctx) {
+  int bseq = blockIdx.x, hh = blockIdx.y, lane = threadIdx.x;
+  extern __shared__ float red[];
+  int64_t ibase = ((int64_t)bseq * NKV + hh) * HD;                    // input [B,NKV,HD]
+  float kk = k[ibase + lane], vv = v[ibase + lane];
+  red[lane] = fabsf(kk); __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] = fmaxf(red[lane], red[lane + s]); __syncthreads(); }
+  float km = red[0]; __syncthreads();
+  red[lane] = fabsf(vv); __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] = fmaxf(red[lane], red[lane + s]); __syncthreads(); }
+  float vm = red[0];
+  float ks = km > 0.f ? km / 448.f : 1.f, vs = vm > 0.f ? vm / 448.f : 1.f;
+  int64_t cpos = ((int64_t)bseq * max_ctx + pos) * NKV + hh;          // cache [B,max_ctx,NKV,HD]
+  kc[cpos * HD + lane] = f_to_fp8(kk / ks); vc[cpos * HD + lane] = f_to_fp8(vv / vs);
+  if (lane == 0) { ksc[cpos] = ks; vsc[cpos] = vs; }
+}
+void store_kv_fp8_batched(const float* k, const float* v, uint8_t* kc, uint8_t* vc, float* ksc, float* vsc,
+                          int B, int NKV, int HD, int pos, int max_ctx) {
+  dim3 grid(B, NKV), block(HD);
+  store_kv_fp8_batched_kernel<<<grid, block, HD * sizeof(float)>>>(k, v, kc, vc, ksc, vsc, B, NKV, HD, pos, max_ctx);
+}
+
+// Each (head, seq) block attends sequence bseq's own fp8 cache over keys [0..pos].
+__global__ void attention_batched_fp8_kernel(const float* __restrict__ q, const uint8_t* __restrict__ kc,
+    const uint8_t* __restrict__ vc, const float* __restrict__ ksc, const float* __restrict__ vsc,
+    float* __restrict__ out, int B, int NH, int NKV, int HD, int pos, int max_ctx) {
+  int h = blockIdx.x, bseq = blockIdx.y, kvh = h / (NH / NKV), lane = threadIdx.x;
+  extern __shared__ float sh[];
+  float* qsh = sh; float* red = sh + HD;
+  qsh[lane] = q[((int64_t)bseq * NH + h) * HD + lane];
+  __syncthreads();
+  float scale = rsqrtf((float)HD);
+  int64_t seqbase = (int64_t)bseq * max_ctx * NKV;                    // this seq's cache origin (in token*head units)
+  float m = -FLT_MAX, l = 0.f, acc = 0.f;
+  for (int tk = 0; tk <= pos; ++tk) {
+    int64_t cpos = seqbase + (int64_t)tk * NKV + kvh;
+    red[lane] = qsh[lane] * (fp8_to_f(kc[cpos * HD + lane]) * ksc[cpos]);
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] += red[lane + s]; __syncthreads(); }
+    float score = red[0] * scale;
+    __syncthreads();
+    float mn = fmaxf(m, score), corr = __expf(m - mn), p = __expf(score - mn);
+    l = l * corr + p;
+    acc = acc * corr + p * (fp8_to_f(vc[cpos * HD + lane]) * vsc[cpos]);
+    m = mn;
+  }
+  out[((int64_t)bseq * NH + h) * HD + lane] = acc / l;
+}
+void attention_batched_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
+                           const float* ksc, const float* vsc, float* out,
+                           int B, int NH, int NKV, int HD, int pos, int max_ctx) {
+  dim3 block(HD), grid(NH, B);
+  attention_batched_fp8_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, ksc, vsc, out, B, NH, NKV, HD, pos, max_ctx);
+}
+
+// B sequences, ONE token each, own conv state [B,C,K-1]; one thread per (seq,channel).
+__global__ void conv1d_state_batched_kernel(const float* __restrict__ x, float* __restrict__ state,
+    const uint16_t* __restrict__ w, float* __restrict__ out, int B, int C, int K) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= B * C) return;
+  int bseq = idx / C, c = idx % C;
+  int64_t sb = ((int64_t)bseq * C + c) * (K - 1);
+  float cur = x[(int64_t)bseq * C + c];
+  float acc = bf16f(w[(int64_t)c * K + (K - 1)]) * cur;
+  for (int j = 0; j < K - 1; ++j) acc += bf16f(w[(int64_t)c * K + j]) * state[sb + j];
+  out[(int64_t)bseq * C + c] = siluf(acc);
+  for (int m = 0; m < K - 2; ++m) state[sb + m] = state[sb + m + 1];
+  state[sb + K - 2] = cur;
+}
+void conv1d_state_batched(const float* x, float* state, const uint16_t* w, float* out, int B, int C, int K) {
+  int block = 256, grid = (B * C + block - 1) / block;
+  conv1d_state_batched_kernel<<<grid, block>>>(x, state, w, out, B, C, K);
+}
+
 // ---- depthwise causal conv1d + SiLU with carried state ----
 // one thread per channel, sequential over the T new tokens, sliding a K-1 window.
 __global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restrict__ state,

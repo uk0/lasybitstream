@@ -41,12 +41,6 @@ void attention_gqa(const float* q, const float* k, const float* v, float* out,
 void attention_cached(const float* q, const float* kc, const float* vc, float* out,
                       int T, int NH, int NKV, int HD, int start_pos);
 
-// Batched decode attention: B sequences each contribute ONE query and attend over
-// their own K/V cache slice. q/out [B,NH,HD]; kc/vc [B, max_ctx, NKV, HD]; each
-// sequence b attends keys 0..pos (inclusive). One block per (head, sequence).
-void attention_batched(const float* q, const float* kc, const float* vc, float* out,
-                       int B, int NH, int NKV, int HD, int pos, int max_ctx);
-
 // FP8 (e4m3) KV cache — 4x smaller than f32. store_kv_fp8 quantizes new K/V
 // [T,NKV,HD] into the fp8 cache at start_pos with a per-(token,kv-head) absmax
 // scale (ksc/vsc, [tot,NKV]); attention_cached_fp8 dequants on read.
@@ -55,6 +49,16 @@ void store_kv_fp8(const float* k, const float* v, uint8_t* kc, uint8_t* vc,
 void attention_cached_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
                           const float* ksc, const float* vsc, float* out,
                           int T, int NH, int NKV, int HD, int start_pos);
+
+// Batched decode (B independent sequences, ONE token each, lockstep at `pos`).
+// Per-sequence fp8 K/V caches are [B, max_ctx, NKV, HD] (scales [B, max_ctx, NKV]).
+void store_kv_fp8_batched(const float* k, const float* v, uint8_t* kc, uint8_t* vc, float* ksc, float* vsc,
+                          int B, int NKV, int HD, int pos, int max_ctx);
+void attention_batched_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
+                           const float* ksc, const float* vsc, float* out,
+                           int B, int NH, int NKV, int HD, int pos, int max_ctx);
+// Depthwise causal conv1d + SiLU, B sequences × 1 token, each with its own state [B,C,K-1].
+void conv1d_state_batched(const float* x, float* state, const uint16_t* w, float* out, int B, int C, int K);
 
 // Depthwise causal conv1d (kernel K) + SiLU with a carried state. `state` holds
 // the previous K-1 inputs per channel [C,K-1] (updated in place); when `first`

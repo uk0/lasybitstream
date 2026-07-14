@@ -23,6 +23,15 @@ void gdn_recurrence(const float* q, const float* k, const float* v,
                     int T, int num_k_heads, int num_v_heads, int head_k, int head_v,
                     bool reset = true, float* snap = nullptr);
 
+// Batched decode variant: B independent sequences, ONE token each, each carrying
+// its own state [B, num_v_heads*head_v*head_k] (never reset here — the caller
+// zeroes it once at sequence start). q/k [B,num_k_heads,head_k], v/out
+// [B,num_v_heads,head_v], g/beta [B,num_v_heads].
+void gdn_recurrence_batched(const float* q, const float* k, const float* v,
+                            const float* g, const float* beta, float scale,
+                            float* out, float* state,
+                            int B, int num_k_heads, int num_v_heads, int head_k, int head_v);
+
 // GDN gating: g = -exp(A_log) * softplus(a + dt_bias),  beta = sigmoid(b).
 //   A_log, dt_bias : [num_v_heads]     a, b : [T, num_v_heads]
 //   g_out, beta_out : [T, num_v_heads]

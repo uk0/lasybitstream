@@ -221,6 +221,94 @@ struct Engine::Impl {
     return argmax(b.logits, VOCAB);
   }
 
+  // One batched decode step: B independent sequences, ONE token each (b.ids_d),
+  // all at global position `pos`. Uses per-sequence caches; writes logits [B,VOCAB].
+  // Every GEMM/norm runs over M=B rows (weights read once per step, amortized over B).
+  void decode_batch(int B, int pos, std::vector<uint8_t*>& kcb, std::vector<uint8_t*>& vcb,
+                    std::vector<float*>& kscb, std::vector<float*>& vscb,
+                    std::vector<float*>& gstb, std::vector<float*>& cstb, float* logits_b, int mc) {
+    std::vector<int> pos3(3 * B, pos);
+    cudaMemcpy(b.pos3d_d, pos3.data(), 3 * B * 4, cudaMemcpyHostToDevice);
+    embed_gather((const uint16_t*)w.up_raw(w.LP + "embed_tokens.weight"), b.ids_d, b.h, B, H);
+    float scale_gdn = 1.0f / std::sqrt((float)L_KD);
+    for (int L = 0; L < NL; ++L) {
+      std::string lp = w.LP + "layers." + std::to_string(L) + ".";
+      rmsnorm(b.h, w.up_f32(lp + "input_layernorm.weight"), EPS, b.xn, B, H);
+      if ((L % FA_INT) == (FA_INT - 1)) {
+        std::string ap = lp + "self_attn";
+        w.nvfp4(b.xn, ap + ".q_proj", b.qg, B, NH * 2 * HD, H);
+        w.nvfp4(b.xn, ap + ".k_proj", b.ak, B, KV_SIZE, H);
+        w.nvfp4(b.xn, ap + ".v_proj", b.av, B, KV_SIZE, H);
+        split_qgate(b.qg, b.aq, b.agate, B, NH, HD);
+        rmsnorm(b.aq, w.up_f32(ap + ".q_norm.weight"), EPS, b.aq, B * NH, HD);
+        rmsnorm(b.ak, w.up_f32(ap + ".k_norm.weight"), EPS, b.ak, B * NKV, HD);
+        rope_mrope(b.aq, b.ak, b.pos3d_d, B, NH, NKV, HD, ROT, THETA);
+        store_kv_fp8_batched(b.ak, b.av, kcb[L], vcb[L], kscb[L], vscb[L], B, NKV, HD, pos, mc);
+        attention_batched_fp8(b.aq, kcb[L], vcb[L], kscb[L], vscb[L], b.aout, B, NH, NKV, HD, pos, mc);
+        mul_sigmoid_gate(b.aout, b.agate, b.agated, B * Q_SIZE);
+        w.nvfp4(b.agated, ap + ".o_proj", b.mix, B, H, Q_SIZE);
+      } else {
+        std::string gp = lp + "linear_attn";
+        w.bf16(b.xn, gp + ".in_proj_qkv", b.qkv, B, CC, H);
+        w.bf16(b.xn, gp + ".in_proj_z", b.z, B, L_V, H);
+        w.bf16(b.xn, gp + ".in_proj_a", b.ga, B, L_VH, H);
+        w.bf16(b.xn, gp + ".in_proj_b", b.gb, B, L_VH, H);
+        conv1d_state_batched(b.qkv, cstb[L], (const uint16_t*)w.up_raw(gp + ".conv1d.weight"), b.conv, B, CC, CONV);
+        cudaMemcpy2D(b.q, L_Q * 4, b.conv, CC * 4, L_Q * 4, B, cudaMemcpyDeviceToDevice);
+        cudaMemcpy2D(b.k, L_Q * 4, b.conv + L_Q, CC * 4, L_Q * 4, B, cudaMemcpyDeviceToDevice);
+        cudaMemcpy2D(b.v, L_V * 4, b.conv + 2 * L_Q, CC * 4, L_V * 4, B, cudaMemcpyDeviceToDevice);
+        gdn_gating(w.up_f32(gp + ".A_log"), b.ga, b.gb, w.up_f32(gp + ".dt_bias"), b.g, b.beta, B, L_VH);
+        gdn_recurrence_batched(b.q, b.k, b.v, b.g, b.beta, scale_gdn, b.recur, gstb[L], B, L_KH, L_VH, L_KD, L_VD);
+        rmsnorm_gated(b.recur, w.up_f32(gp + ".norm.weight"), b.z, EPS, b.gated, B * L_VH, L_VD);
+        w.nvfp4(b.gated, gp + ".out_proj", b.mix, B, H, L_V);
+      }
+      add_inplace(b.h, b.mix, B * H);
+      rmsnorm(b.h, w.up_f32(lp + "post_attention_layernorm.weight"), EPS, b.xn2, B, H);
+      w.nvfp4(b.xn2, lp + "mlp.gate_proj", b.mg, B, INTER, H);
+      w.nvfp4(b.xn2, lp + "mlp.up_proj", b.mu, B, INTER, H);
+      swiglu(b.mg, b.mu, b.msw, (int64_t)B * INTER);
+      w.nvfp4(b.msw, lp + "mlp.down_proj", b.mix, B, H, INTER);
+      add_inplace(b.h, b.mix, B * H);
+    }
+    rmsnorm(b.h, w.up_f32(w.LP + "norm.weight"), EPS, b.xn, B, H);
+    gemm_bf16(b.xn, (const uint16_t*)w.up_raw("lm_head.weight"), logits_b, B, VOCAB, H);
+  }
+
+  // Aggregate decode throughput: B sequences decoded together, `steps` steps each,
+  // from a warm context of `ctx` tokens. Returns tokens/s across all B sequences.
+  double bench_decode(int B, int ctx, int steps) {
+    std::vector<uint8_t*> kcb(NL, nullptr), vcb(NL, nullptr);
+    std::vector<float*> kscb(NL, nullptr), vscb(NL, nullptr), gstb(NL, nullptr), cstb(NL, nullptr);
+    int mc = ctx + steps + 8;
+    for (int L = 0; L < NL; ++L) {
+      if ((L % FA_INT) == (FA_INT - 1)) {
+        kcb[L] = dalloc_u8((int64_t)B * mc * NKV * HD); vcb[L] = dalloc_u8((int64_t)B * mc * NKV * HD);
+        kscb[L] = dalloc((int64_t)B * mc * NKV); vscb[L] = dalloc((int64_t)B * mc * NKV);
+      } else {
+        gstb[L] = dalloc((int64_t)B * L_VH * L_VD * L_KD); cudaMemset(gstb[L], 0, (int64_t)B * L_VH * L_VD * L_KD * 4);
+        cstb[L] = dalloc((int64_t)B * CC * (CONV - 1)); cudaMemset(cstb[L], 0, (int64_t)B * CC * (CONV - 1) * 4);
+      }
+    }
+    float* logits_b = dalloc((int64_t)B * VOCAB);
+    std::vector<int> ids(B, 100);
+    cudaMemcpy(b.ids_d, ids.data(), B * 4, cudaMemcpyHostToDevice);
+    for (int s = 0; s < 3; ++s) decode_batch(B, ctx + s, kcb, vcb, kscb, vscb, gstb, cstb, logits_b, mc);  // warmup
+    cudaDeviceSynchronize();
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    for (int s = 0; s < steps; ++s) decode_batch(B, ctx + 3 + s, kcb, vcb, kscb, vscb, gstb, cstb, logits_b, mc);
+    cudaEventRecord(e1); cudaEventSynchronize(e1);
+    float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+    if (B > 1) {   // all B sequences are identical here -> every logit row must match (no cross-seq leak)
+      int a0 = argmax(logits_b, VOCAB), a1 = argmax(logits_b + (int64_t)(B - 1) * VOCAB, VOCAB);
+      printf("       [check: row0=%d row%d=%d %s]  ", a0, B - 1, a1, a0 == a1 ? "OK" : "MISMATCH");
+    }
+    for (int L = 0; L < NL; ++L) { cudaFree(kcb[L]); cudaFree(vcb[L]); cudaFree(kscb[L]); cudaFree(vscb[L]); cudaFree(gstb[L]); cudaFree(cstb[L]); }
+    cudaFree(logits_b);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    return (double)B * steps / ((double)ms / 1000.0);
+  }
+
   // ---- MTP speculative decoding ----
   // MTP scratch (T=1) + its own attention KV cache.
   float *m_emb=nullptr,*m_hn=nullptr,*m_en=nullptr,*m_cat=nullptr,*m_x=nullptr,*m_xn=nullptr,*m_tmp=nullptr;
@@ -500,6 +588,8 @@ double Engine::bench(int M, int iters) {
   cudaFree(x); cudaFree(y);
   return 1000.0 * M * iters / ms;                      // aggregate tok/s (GEMM-bound)
 }
+
+double Engine::bench_decode(int B, int ctx, int steps) { return p_->bench_decode(B, ctx, steps); }
 
 int Engine::max_ctx() const { return p_->max_ctx; }
 

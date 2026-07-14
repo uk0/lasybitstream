@@ -69,6 +69,51 @@ void gdn_recurrence(const float* q, const float* k, const float* v, const float*
                                               T, HK, HV, DK, DV, snap);
 }
 
+// Batched decode: B independent sequences, ONE token each, own state [B,HV,DV,DK].
+// grid (HV, B) — one block per (v-head, sequence); blockDim.x = DV (thread r owns state row r).
+__global__ void gdn_recurrence_batched_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                              const float* __restrict__ v, const float* __restrict__ g,
+                                              const float* __restrict__ beta, float scale,
+                                              float* __restrict__ out, float* __restrict__ state,
+                                              int B, int HK, int HV, int DK, int DV) {
+  extern __shared__ float sh[];
+  float* ksh = sh; float* qsh = sh + DK; float* red = sh + 2 * DK;
+  int hv = blockIdx.x, bseq = blockIdx.y, r = threadIdx.x;
+  int kh = hv / (HV / HK);
+  float* S = state + ((int64_t)bseq * HV + hv) * DV * DK;             // this seq+head state
+  const float* kt = k + ((int64_t)bseq * HK + kh) * DK;              // row bseq
+  const float* qt = q + ((int64_t)bseq * HK + kh) * DK;
+  if (r < DK) { ksh[r] = kt[r]; qsh[r] = qt[r]; }
+  __syncthreads();
+  for (int pass = 0; pass < 2; ++pass) {
+    float* vec = pass == 0 ? ksh : qsh;
+    red[r] = (r < DK) ? vec[r] * vec[r] : 0.f;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (r < s) red[r] += red[r + s]; __syncthreads(); }
+    float inv = rsqrtf(red[0] + 1e-6f);
+    __syncthreads();
+    if (r < DK) vec[r] = vec[r] * inv * (pass == 1 ? scale : 1.f);
+    __syncthreads();
+  }
+  float gt = expf(g[(int64_t)bseq * HV + hv]);
+  float bt = beta[(int64_t)bseq * HV + hv];
+  float* Srow = S + (int64_t)r * DK;
+  float vpred = 0.f;
+  for (int c = 0; c < DK; ++c) { Srow[c] *= gt; vpred += Srow[c] * ksh[c]; }
+  float vr = (v[((int64_t)bseq * HV + hv) * DV + r] - vpred) * bt;
+  float o = 0.f;
+  for (int c = 0; c < DK; ++c) { Srow[c] += vr * ksh[c]; o += Srow[c] * qsh[c]; }
+  out[((int64_t)bseq * HV + hv) * DV + r] = o;
+}
+void gdn_recurrence_batched(const float* q, const float* k, const float* v, const float* g,
+                            const float* beta, float scale, float* out, float* state,
+                            int B, int HK, int HV, int DK, int DV) {
+  dim3 grid(HV, B);
+  int block = DV;
+  size_t shmem = (2 * DK + block) * sizeof(float);
+  gdn_recurrence_batched_kernel<<<grid, block, shmem>>>(q, k, v, g, beta, scale, out, state, B, HK, HV, DK, DV);
+}
+
 __global__ void gdn_gating_kernel(const float* __restrict__ A_log, const float* __restrict__ a,
                                   const float* __restrict__ b, const float* __restrict__ dt_bias,
                                   float* __restrict__ g_out, float* __restrict__ beta_out,
