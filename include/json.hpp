@@ -6,6 +6,7 @@
 #include <map>
 #include <stdexcept>
 #include <cstdlib>
+#include <cstdio>
 
 namespace lb {
 
@@ -33,6 +34,33 @@ struct Json {
   double f64(double d = 0) const { return t == Num ? num : d; }
   std::string s(const std::string& d = "") const { return t == Str ? str : d; }
   bool boolean(bool d = false) const { return t == Bool ? b : d; }
+
+  // Serialize back to compact JSON (for embedding tool specs and tool-call args).
+  static void esc(std::string& o, const std::string& v) {
+    o += '"';
+    for (unsigned char c : v) switch (c) {
+      case '"': o += "\\\""; break; case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break; case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break; case '\b': o += "\\b"; break; case '\f': o += "\\f"; break;
+      default: if (c < 0x20) { char bb[8]; snprintf(bb, 8, "\\u%04x", c); o += bb; } else o += (char)c;
+    }
+    o += '"';
+  }
+  void ser(std::string& o) const {
+    switch (t) {
+      case Null: o += "null"; break;
+      case Bool: o += b ? "true" : "false"; break;
+      case Num:
+        if (num == (double)(long long)num && num < 9e15 && num > -9e15) o += std::to_string((long long)num);
+        else { char bb[32]; snprintf(bb, 32, "%.10g", num); o += bb; }
+        break;
+      case Str: esc(o, str); break;
+      case Arr: { o += '['; for (size_t i = 0; i < arr.size(); ++i) { if (i) o += ','; arr[i].ser(o); } o += ']'; break; }
+      case Obj: { o += '{'; bool f = true; for (auto& kv : obj) { if (!f) o += ','; f = false; esc(o, kv.first); o += ':'; kv.second.ser(o); } o += '}'; break; }
+    }
+  }
+  std::string serialize() const { std::string o; ser(o); return o; }
+  static Json mkstr(const std::string& v) { Json j; j.t = Str; j.str = v; return j; }
 };
 
 class JsonParser {
