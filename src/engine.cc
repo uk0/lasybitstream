@@ -570,9 +570,13 @@ double Engine::bench(int M, int iters) {
       std::string lp = p_->w.LP + "layers." + std::to_string(L) + ".";
       bool attn = (L % FA_INT) == (FA_INT - 1);
       if (attn) { p_->w.nvfp4(x, lp + "self_attn.q_proj", y, M, NH * 2 * HD, H);
+                  p_->w.nvfp4(x, lp + "self_attn.k_proj", y, M, KV_SIZE, H);
+                  p_->w.nvfp4(x, lp + "self_attn.v_proj", y, M, KV_SIZE, H);
                   p_->w.nvfp4(x, lp + "self_attn.o_proj", y, M, H, Q_SIZE); }
       else { p_->w.bf16(x, lp + "linear_attn.in_proj_qkv", y, M, L_Q * 2 + L_V, H);
              p_->w.bf16(x, lp + "linear_attn.in_proj_z", y, M, L_V, H);
+             p_->w.bf16(x, lp + "linear_attn.in_proj_a", y, M, L_VH, H);
+             p_->w.bf16(x, lp + "linear_attn.in_proj_b", y, M, L_VH, H);
              p_->w.nvfp4(x, lp + "linear_attn.out_proj", y, M, H, L_V); }
       p_->w.nvfp4(x, lp + "mlp.gate_proj", y, M, INTER, H);
       p_->w.nvfp4(x, lp + "mlp.up_proj", y, M, INTER, H);
