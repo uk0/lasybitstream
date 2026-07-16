@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   if (decbench) {                                       // real aggregate decode (per-seq KV/GDN/conv state)
     Engine eng; eng.load(mdir, 640);
     printf("=== batched decode throughput (real per-seq state, ctx=256, 32 steps) ===\n");
-    for (int B : {1, 8, 16, 32, 48, 64}) printf("  B=%3d : %.1f tok/s\n", B, eng.bench_decode(B, 256, 32));
+    for (int B : {1, 16, 32, 64, 96, 128}) printf("  B=%3d : %.1f tok/s\n", B, eng.bench_decode(B, 256, 32));
     return 0;
   }
 
