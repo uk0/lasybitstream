@@ -29,6 +29,11 @@ __global__ void gemm_bf16_kernel(const float* __restrict__ x, const uint16_t* __
 // 1024. No shared staging / no barriers — activations (tiny, L2-resident) are read
 // straight from global, and each K-tile issues all four 128-bit weight loads before
 // the FMAs so the load latency is hidden (bf16 has little ALU to hide it otherwise).
+// M=1 (decode) BF16 GEMV, software-pipelined in REGISTERS: prefetch tile k+1's 32
+// weights (uint4) while computing tile k, activations read float4 from global. A
+// cp.async.cg.shared.global double-buffered variant was A/B-tested (researcher-directed)
+// and REGRESSED (6.50 vs 7.34 tok/s) — the 32KB shared cut occupancy more than the
+// lower register pressure recovered; the register prefetch already saturates MLP.
 template <int WARPS>
 __global__ void gemv_bf16_m1_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                                     float* __restrict__ y, int OUT, int IN) {
@@ -390,9 +395,51 @@ __global__ void attention_cached_fp8_kernel(const float* __restrict__ q,
   }
   out[(((int64_t)i * NH + h) * HD) + lane] = acc / l;
 }
+// Single-stream DECODE (T=1) attention: one warp per head, DPT=HD/32 dims/lane in
+// registers, per-key q·k via warp shuffles — no shared memory, ZERO __syncthreads
+// (the T-query block kernel did ~log2(HD) syncs per key across 16 attention layers).
+template <int DPT>
+__global__ void attention_cached_fp8_warp_kernel(const float* __restrict__ q, const uint8_t* __restrict__ kc,
+    const uint8_t* __restrict__ vc, const float* __restrict__ ksc, const float* __restrict__ vsc,
+    float* __restrict__ out, int NH, int NKV, int HD, int start_pos) {
+  int h = blockIdx.x, kvh = h / (NH / NKV), lane = threadIdx.x;
+  const float* qrow = q + (int64_t)h * HD;
+  float qreg[DPT], acc[DPT];
+#pragma unroll
+  for (int d = 0; d < DPT; ++d) { qreg[d] = qrow[lane * DPT + d]; acc[d] = 0.f; }
+  float scale = rsqrtf((float)HD);
+  float m = -FLT_MAX, l = 0.f;
+  for (int tk = 0; tk <= start_pos; ++tk) {
+    int64_t cpos = (int64_t)tk * NKV + kvh;
+    float ks = ksc[cpos];
+    const uint8_t* krow = kc + cpos * HD + lane * DPT;
+    float prod = 0.f;
+#pragma unroll
+    for (int d = 0; d < DPT; ++d) prod += qreg[d] * (fp8_to_f(krow[d]) * ks);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) prod += __shfl_down_sync(0xffffffffu, prod, o);
+    float score = __shfl_sync(0xffffffffu, prod, 0) * scale;
+    float mn = fmaxf(m, score), corr = __expf(m - mn), p = __expf(score - mn);
+    l = l * corr + p;
+    float vs = vsc[cpos];
+    const uint8_t* vrow = vc + cpos * HD + lane * DPT;
+#pragma unroll
+    for (int d = 0; d < DPT; ++d) acc[d] = acc[d] * corr + p * (fp8_to_f(vrow[d]) * vs);
+    m = mn;
+  }
+  float* orow = out + (int64_t)h * HD + lane * DPT;
+#pragma unroll
+  for (int d = 0; d < DPT; ++d) orow[d] = acc[d] / l;
+}
 void attention_cached_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
                           const float* ksc, const float* vsc, float* out,
                           int T, int NH, int NKV, int HD, int start_pos) {
+  static int block_attn = -1;
+  if (block_attn < 0) block_attn = getenv("LB_BLOCKATTN") ? 1 : 0;   // A/B toggle
+  if (T == 1 && HD == 256 && !block_attn) {   // decode: sync-free warp-per-head path
+    attention_cached_fp8_warp_kernel<8><<<NH, 32>>>(q, kc, vc, ksc, vsc, out, NH, NKV, HD, start_pos);
+    return;
+  }
   dim3 block(HD), grid(NH, T);
   attention_cached_fp8_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, ksc, vsc, out, T, NH, NKV, HD, start_pos);
 }
