@@ -423,37 +423,50 @@ void store_kv_fp8_batched(const float* k, const float* v, uint8_t* kc, uint8_t* 
   store_kv_fp8_batched_kernel<<<grid, block, HD * sizeof(float)>>>(k, v, kc, vc, ksc, vsc, B, NKV, HD, pos, max_ctx);
 }
 
-// Each (head, seq) block attends sequence bseq's own fp8 cache over keys [0..pos].
-__global__ void attention_batched_fp8_kernel(const float* __restrict__ q, const uint8_t* __restrict__ kc,
+// Each (head, seq) is handled by ONE warp: 32 lanes, DPT=HD/32 dims per lane held
+// in registers. The per-key q·k dot product reduces via warp shuffles (no shared
+// memory, ZERO __syncthreads) — the old block-per-(head,seq) kernel cost ~log2(HD)
+// syncs per key over the O(pos) loop, which dominated the batched attention.
+template <int DPT>
+__global__ void attention_batched_fp8_warp_kernel(const float* __restrict__ q, const uint8_t* __restrict__ kc,
     const uint8_t* __restrict__ vc, const float* __restrict__ ksc, const float* __restrict__ vsc,
     float* __restrict__ out, int B, int NH, int NKV, int HD, int pos, int max_ctx) {
-  int h = blockIdx.x, bseq = blockIdx.y, kvh = h / (NH / NKV), lane = threadIdx.x;
-  extern __shared__ float sh[];
-  float* qsh = sh; float* red = sh + HD;
-  qsh[lane] = q[((int64_t)bseq * NH + h) * HD + lane];
-  __syncthreads();
+  int h = blockIdx.x, bseq = blockIdx.y, kvh = h / (NH / NKV), lane = threadIdx.x;   // lane 0..31
+  const float* qrow = q + ((int64_t)bseq * NH + h) * HD;
+  float qreg[DPT], acc[DPT];
+#pragma unroll
+  for (int d = 0; d < DPT; ++d) { qreg[d] = qrow[lane * DPT + d]; acc[d] = 0.f; }
   float scale = rsqrtf((float)HD);
-  int64_t seqbase = (int64_t)bseq * max_ctx * NKV;                    // this seq's cache origin (in token*head units)
-  float m = -FLT_MAX, l = 0.f, acc = 0.f;
+  int64_t seqbase = (int64_t)bseq * max_ctx * NKV;
+  float m = -FLT_MAX, l = 0.f;
   for (int tk = 0; tk <= pos; ++tk) {
     int64_t cpos = seqbase + (int64_t)tk * NKV + kvh;
-    red[lane] = qsh[lane] * (fp8_to_f(kc[cpos * HD + lane]) * ksc[cpos]);
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (lane < s) red[lane] += red[lane + s]; __syncthreads(); }
-    float score = red[0] * scale;
-    __syncthreads();
+    float ks = ksc[cpos];
+    const uint8_t* krow = kc + cpos * HD + lane * DPT;
+    float prod = 0.f;
+#pragma unroll
+    for (int d = 0; d < DPT; ++d) prod += qreg[d] * (fp8_to_f(krow[d]) * ks);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) prod += __shfl_down_sync(0xffffffffu, prod, o);
+    float score = __shfl_sync(0xffffffffu, prod, 0) * scale;         // broadcast q·k to all lanes
     float mn = fmaxf(m, score), corr = __expf(m - mn), p = __expf(score - mn);
     l = l * corr + p;
-    acc = acc * corr + p * (fp8_to_f(vc[cpos * HD + lane]) * vsc[cpos]);
+    float vs = vsc[cpos];
+    const uint8_t* vrow = vc + cpos * HD + lane * DPT;
+#pragma unroll
+    for (int d = 0; d < DPT; ++d) acc[d] = acc[d] * corr + p * (fp8_to_f(vrow[d]) * vs);
     m = mn;
   }
-  out[((int64_t)bseq * NH + h) * HD + lane] = acc / l;
+  float* orow = out + ((int64_t)bseq * NH + h) * HD + lane * DPT;
+#pragma unroll
+  for (int d = 0; d < DPT; ++d) orow[d] = acc[d] / l;
 }
 void attention_batched_fp8(const float* q, const uint8_t* kc, const uint8_t* vc,
                            const float* ksc, const float* vsc, float* out,
                            int B, int NH, int NKV, int HD, int pos, int max_ctx) {
-  dim3 block(HD), grid(NH, B);
-  attention_batched_fp8_kernel<<<grid, block, (HD + HD) * sizeof(float)>>>(q, kc, vc, ksc, vsc, out, B, NH, NKV, HD, pos, max_ctx);
+  dim3 grid(NH, B);
+  if (HD == 256) attention_batched_fp8_warp_kernel<8><<<grid, 32>>>(q, kc, vc, ksc, vsc, out, B, NH, NKV, HD, pos, max_ctx);
+  else           attention_batched_fp8_warp_kernel<4><<<grid, 32>>>(q, kc, vc, ksc, vsc, out, B, NH, NKV, HD, pos, max_ctx);
 }
 
 // B sequences, ONE token each, own conv state [B,C,K-1]; one thread per (seq,channel).
